@@ -1,0 +1,167 @@
+{
+  "name": "safelight",
+  "productName": "Safelight",
+  "version": "1.0.0",
+  "description": "A fast raw and photo developer",
+  "main": "main/main.js",
+  "author": "Shrishon",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux",
+    "pack": "electron-builder --dir"
+  },
+  "dependencies": {
+    "dcraw": "^1.0.3"
+  },
+  "devDependencies": {
+    "electron": "^32.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "dev.safelight.app",
+    "productName": "Safelight",
+    "copyright": "Copyright \u00a9 2026",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main/**/*",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "fileAssociations": [
+      {
+        "ext": [
+          "fedr"
+        ],
+        "name": "Safelight linear raw",
+        "role": "Editor"
+      },
+      {
+        "ext": [
+          "cr2",
+          "cr3",
+          "nef",
+          "arw",
+          "dng",
+          "raf",
+          "rw2",
+          "orf"
+        ],
+        "name": "Camera raw photo",
+        "role": "Editor"
+      },
+      {
+        "ext": [
+          "jpg",
+          "jpeg",
+          "png",
+          "webp"
+        ],
+        "name": "Photo",
+        "role": "Editor"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.photography",
+      "icon": "build/icon.png",
+      "darkModeSupport": true,
+      "identity": null,
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ]
+    },
+    "dmg": {
+      "title": "Safelight ${version}",
+      "backgroundColor": "#0d1116",
+      "contents": [
+        {
+          "x": 140,
+          "y": 200,
+          "type": "file"
+        },
+        {
+          "x": 400,
+          "y": 200,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "win": {
+      "icon": "build/icon.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Safelight",
+      "installerHeaderIcon": "build/icon.png"
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "category": "Graphics",
+      "synopsis": "A fast raw and photo developer",
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "fileAssociations": [
+        {
+          "ext": "fedr",
+          "name": "Safelight linear raw",
+          "mimeType": "application/x-fedr"
+        },
+        {
+          "ext": "arw",
+          "name": "Camera raw photo",
+          "mimeType": "image/x-sony-arw"
+        },
+        {
+          "ext": "cr2",
+          "name": "Camera raw photo",
+          "mimeType": "image/x-canon-cr2"
+        },
+        {
+          "ext": "nef",
+          "name": "Camera raw photo",
+          "mimeType": "image/x-nikon-nef"
+        },
+        {
+          "ext": "dng",
+          "name": "Camera raw photo",
+          "mimeType": "image/x-adobe-dng"
+        }
+      ]
+    }
+  }
+}
