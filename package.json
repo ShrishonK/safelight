@@ -1,7 +1,7 @@
 {
   "name": "safelight",
   "productName": "Safelight",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "A fast raw and photo developer",
   "main": "main/main.js",
   "author": {
@@ -80,14 +80,12 @@
         {
           "target": "dmg",
           "arch": [
-            "arm64",
-            "x64"
+            "arm64"
           ]
         },
         {
           "target": "zip",
           "arch": [
-            "arm64",
             "x64"
           ]
         }

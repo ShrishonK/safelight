@@ -65,6 +65,7 @@ jobs:
           name: safelight-${{ matrix.os }}
           path: |
             dist/*.dmg
+            dist/*.zip
             dist/*.exe
             dist/*.AppImage
             dist/*.deb
