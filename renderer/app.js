@@ -30,7 +30,7 @@ function defaults() {
     // color grading
     shHue: 220, shSat: 0, miHue: 0, miSat: 0, hiHue: 40, hiSat: 0, cgBal: 0,
     // detail
-    sharpen: 0, sharpRadius: 1.0, sharpDetail: 25, nrLum: 0, nrColor: 0,
+    sharpen: 0, sharpRadius: 1.0, sharpDetail: 25, nrLum: 0, nrColor: 0, nrDetail: 50,
     // effects
     vignette: 0, vigFeather: 50, vigRound: 0, grain: 0, grainSize: 25,
     // masks
@@ -374,6 +374,9 @@ function autoDenoise() {
   s.nrLum = +clamp((n.lum - 0.0012) * 150, 0, 0.75).toFixed(2);
   s.nrColor = +clamp((n.chroma - 0.0010) * 260, 0, 0.90).toFixed(2);
   // heavy smoothing needs a higher sharpening threshold or it re-etches the grain
+  if (s.nrDetail === undefined) s.nrDetail = 50;
+  // more smoothing needs a higher detail threshold to hold edges and stars
+  s.nrDetail = Math.round(clamp(45 + s.nrLum * 45, 45, 85));
   if (s.sharpen > 0 && s.nrLum > 0.25) s.sharpDetail = Math.max(s.sharpDetail, 60);
   syncAll();
   requestRender(true);
@@ -511,7 +514,7 @@ uniform sampler2D uBase, uBlur, uBlur2, uLUT, uBrush0, uBrush1, uBrush2, uBrush3
 uniform vec2 uTexel, uVS, uVO;
 uniform float uAspect, uSeed;
 uniform float uClarity, uTexture, uDehaze, uVib, uSat;
-uniform float uSharp, uSharpR, uSharpD, uNrL, uNrC;
+uniform float uSharp, uSharpR, uSharpD, uNrL, uNrC, uNrD;
 uniform float uVig, uVigF, uVigR, uGrain, uGrainS;
 uniform vec3 uCGs, uCGm, uCGh; uniform float uCGbal;
 uniform float uHslH[8], uHslS[8], uHslL[8], uHslC[8];
@@ -574,9 +577,18 @@ void main(){
       acc += s1*w1 + s2*w2; ws += w1 + w2;
     }
     vec3 den = acc/ws;
-    // hand back a little fine detail so stars survive the smoothing
-    float keep = 0.16*(1.-clamp(uNrL,0.,1.));
-    c = mix(c, den + (c-den)*keep, clamp(uNrL*1.15,0.,1.));
+    // Split into a smoothed base and a detail layer, then soft-threshold the
+    // detail: anything smaller than the noise floor is dropped, anything above
+    // it is returned untouched. Edges and stars come back at full strength
+    // instead of being averaged away.
+    vec3 d = c - den;
+    float dl = luma(d);
+    float thr = (0.004 + 0.02*uNrL) * (1.0 - 0.92*uNrD);
+    float keep = max(abs(dl) - thr, 0.0);
+    float scale = abs(dl) > 1e-6 ? keep/abs(dl) : 0.0;
+    // a floor so heavily smoothed areas keep some microtexture and don't go plastic
+    scale = max(scale, 0.10*uNrD);
+    c = den + d*scale;
   }
   if(uNrC>0.001){
     float lc = luma(c);
@@ -874,6 +886,7 @@ function develop(im, vw, vh, VS_, VO_, forExport) {
   gl.uniform1f(u.uDehaze, s.dehaze); gl.uniform1f(u.uVib, s.vibrance); gl.uniform1f(u.uSat, s.saturation);
   gl.uniform1f(u.uSharp, s.sharpen); gl.uniform1f(u.uSharpR, s.sharpRadius);
   gl.uniform1f(u.uSharpD, s.sharpDetail / 100); gl.uniform1f(u.uNrL, s.nrLum); gl.uniform1f(u.uNrC, s.nrColor);
+  gl.uniform1f(u.uNrD, (s.nrDetail === undefined ? 50 : s.nrDetail) / 100);
   gl.uniform1f(u.uVig, s.vignette); gl.uniform1f(u.uVigF, s.vigFeather); gl.uniform1f(u.uVigR, s.vigRound);
   gl.uniform1f(u.uGrain, s.grain); gl.uniform1f(u.uGrainS, s.grainSize);
   const cg = (h, sat) => { const c = hsv2rgbJS(h, 1, 1); const k = sat / 100 * 0.42; return [(c[0] - 0.5) * k, (c[1] - 0.5) * k, (c[2] - 0.5) * k]; };
@@ -1021,6 +1034,7 @@ function buildPanels() {
     ag.append(ab); b.append(ag);
     sl(b, 'nrLum', 'Noise · luminance', 0, 1, .01, 0);
     sl(b, 'nrColor', 'Noise · color', 0, 1, .01, 0);
+    sl(b, 'nrDetail', 'Noise · detail', 0, 100, 1, 50, 'int');
     b.insertAdjacentHTML('beforeend', '<div class="hint">Long exposures: start at 0.25 luminance, 0.4 color, then raise sharpening detail to protect stars.</div>');
   });
 
