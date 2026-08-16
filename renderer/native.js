@@ -73,10 +73,10 @@ function parsePPM(buf) {
   return { w, h, maxv, off: i, bytes: b };
 }
 
-async function decodeRaw(name, bytes) {
+async function decodeRaw(name, bytes, half) {
   await ensureDcraw();
   const opts = { useCameraWhiteBalance: true, use16BitLinearMode: true };
-  if (PREFS.halfRaw) opts.setHalfSizeMode = true;
+  if (half || PREFS.halfRaw) opts.setHalfSizeMode = true;
   let meta = {};
   try {
     const txt = window.dcraw(bytes, { verbose: true, identify: true });
@@ -86,7 +86,13 @@ async function decodeRaw(name, bytes) {
     }
   } catch (e) { /* metadata is a nicety, not a requirement */ }
 
-  let out = window.dcraw(bytes, opts);
+  let out;
+  try {
+    out = window.dcraw(bytes, opts);
+  } catch (e) {
+    const m = String(e && e.message || e);
+    throw new Error(/memory|allocat/i.test(m) ? 'the decoder ran out of memory on this frame' : 'the decoder failed: ' + m.slice(0, 160));
+  }
   if (out && typeof out === 'object' && !(out instanceof Uint8Array)) out = Object.values(out)[0];
   if (!out || typeof out === 'string' || out.length < 64) throw new Error('this file is not a raw image the decoder recognises');
 
@@ -111,6 +117,16 @@ async function decodeRaw(name, bytes) {
   return { w, h, rgba, meta };
 }
 
+function showError(title, lines) {
+  document.getElementById('card').innerHTML =
+    `<h4>${title}</h4><div class="cbody">` +
+    lines.map(l => `<div class="hint" style="color:var(--text);margin:6px 0">${l}</div>`).join('') +
+    `<div class="hint">More detail is in View → Toggle Developer Tools → Console.</div></div>` +
+    `<div class="foot"><button class="tb primary" id="erOk">Close</button></div>`;
+  document.getElementById('modal').classList.add('open');
+  document.getElementById('erOk').onclick = () => document.getElementById('modal').classList.remove('open');
+}
+
 /* build an editor image straight from linear half-float pixels */
 function imageFromLinear(name, w, h, rgba, meta) {
   const im = baseImage(name, w, h, true);
@@ -127,24 +143,38 @@ function imageFromLinear(name, w, h, rgba, meta) {
 const _loadFiles = loadFiles;
 window.loadFiles = async function (files) {
   const list = [...files];
-  const plain = [];
+  const failed = [];
   for (const f of list) {
-    if (!RAWRE.test(f.name)) { plain.push(f); continue; }
+    const before = A.imgs.length;
     try {
-      await busy('Developing ' + f.name + ' — first open of a raw takes a moment');
-      const bytes = new Uint8Array(await f.arrayBuffer());
-      const r = await decodeRaw(f.name, bytes);
-      const im = imageFromLinear(f.name, r.w, r.h, r.rgba, r.meta);
-      A.imgs.push(im);
+      if (RAWRE.test(f.name)) {
+        await busy('Developing ' + f.name + ' — the first open of a raw takes a moment');
+        const bytes = new Uint8Array(await f.arrayBuffer());
+        let r;
+        try {
+          r = await decodeRaw(f.name, bytes, false);
+        } catch (e1) {
+          console.warn('full-size decode failed, retrying half size:', e1);
+          await busy('Retrying ' + f.name + ' at half size');
+          r = await decodeRaw(f.name, bytes, true);
+          toast(f.name + ' opened at half size');
+        }
+        A.imgs.push(imageFromLinear(f.name, r.w, r.h, r.rgba, r.meta));
+      } else {
+        await _loadFiles([f]);
+        if (A.imgs.length === before) throw new Error('the image decoder rejected this file');
+      }
     } catch (e) {
-      console.error(e);
-      toast(f.name + ': ' + e.message);
-    } finally { busy(null); }
+      console.error('open failed:', f.name, e);
+      failed.push(f.name + ' — ' + (e && e.message ? e.message : e));
+    } finally {
+      busy(null);
+    }
   }
-  if (plain.length) await _loadFiles(plain);
   document.getElementById('drop').hidden = A.imgs.length > 0;
   buildStrip();
   if (A.cur < 0 && A.imgs.length) selectImage(0);
+  if (failed.length) showError(failed.length + ' file(s) could not be opened', failed);
 };
 
 async function openNative() {
@@ -349,8 +379,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   const drop = document.getElementById('drop');
-  drop.innerHTML = `<b>Drop photos here</b>
+  drop.innerHTML = `<div><b>Drop photos here</b>
     Camera raw — CR2 · CR3 · NEF · ARW · DNG · RAF · RW2 · ORF — developed in place<br>
     JPEG · PNG · WebP · <kbd>.fedr</kbd> linear raw<br>
-    <kbd>⌘O</kbd> open · <kbd>\\</kbd> compare · <kbd>M</kbd> mask · <kbd>⌘E</kbd> export`;
+    <kbd>⌘O</kbd> open · <kbd>\\</kbd> compare · <kbd>M</kbd> mask · <kbd>${info.platform === 'darwin' ? '⌘E' : 'Ctrl+E'}</kbd> export</div>`;
 });
