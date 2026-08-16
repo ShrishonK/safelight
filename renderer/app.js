@@ -297,6 +297,90 @@ function drawHisto() {
   if (shad > 0.0005) { g.fillStyle = 'rgba(120,170,255,.9)'; g.fillRect(0, 0, 6 * dpr, 6 * dpr); }
 }
 
+
+/* ============================================================
+   noise measurement + auto denoise
+   Noise only exists at 1:1, so this develops a native-resolution
+   window with NR, sharpening and local contrast switched off, then
+   reads the high-frequency energy that is left.
+   ============================================================ */
+function measureNoise(im) {
+  const s = im.s, G = geom(s, im.w, im.h);
+  const W = Math.min(256, Math.round(G.outW)), H = Math.min(256, Math.round(G.outH));
+  const VS = [W / G.outW, H / G.outH];
+  const probe = Object.assign({}, JSON.parse(JSON.stringify(s)), {
+    nrLum: 0, nrColor: 0, sharpen: 0, clarity: 0, texture: 0, dehaze: 0,
+    grain: 0, vignette: 0, masks: []
+  });
+  // one window can land on something atypically flat (a black jacket) or busy
+  // (a star field), so sample a spread and take the median
+  const spots = [[.5, .5], [.3, .28], [.7, .28], [.3, .72], [.7, .72]];
+  const saved = im.s;
+  const lums = [], chrs = [];
+  try {
+    im.s = probe;
+    for (const spot of spots) {
+      const vo = [clamp(spot[0], VS[0] / 2, 1 - VS[0] / 2), clamp(spot[1], VS[1] / 2, 1 - VS[1] / 2)];
+      const R = develop(im, W, H, VS, vo, true);
+      const px = new Uint8Array(W * H * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, R.out.fb);
+      gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      const r = windowNoise(px, W, H);
+      lums.push(r.lum); chrs.push(r.chroma);
+    }
+  } finally {
+    im.s = saved;
+    freeExport();
+  }
+  const mid = a => { a.sort((p, q) => p - q); return a[a.length >> 1] || 0; };
+  return { lum: mid(lums), chroma: mid(chrs), spots: spots.length };
+}
+
+/* high-frequency energy of one window, in output-referred sigma */
+function windowNoise(px, W, H) {
+  // A plain mean would count every star and edge as noise, and a median lands on
+  // 8-bit quantisation steps, so take a trimmed mean of the quiet middle of the
+  // distribution: flat areas, sub-quantum resolution.
+  const lum = [], chr = [];
+  const Y = (i) => (0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]) / 255;
+  const C1 = (i) => (px[i] - px[i + 2]) / 255;                       // red - blue
+  const C2 = (i) => (px[i + 1] - (px[i] + px[i + 2]) * 0.5) / 255;   // green - magenta
+  const lap = (f, i) => Math.abs(4 * f(i) - f(i - 4) - f(i + 4) - f(i - W * 4) - f(i + W * 4));
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = (y * W + x) * 4;
+      lum.push(lap(Y, i));
+      chr.push(Math.max(lap(C1, i), lap(C2, i)));
+    }
+  }
+  const band = a => {
+    a.sort((p, q) => p - q);
+    const lo = Math.floor(a.length * 0.45), hi = Math.floor(a.length * 0.90);
+    let t = 0; for (let i = lo; i < hi; i++) t += a[i];
+    return t / Math.max(1, hi - lo);
+  };
+  const k = 1.253 / Math.sqrt(20);   // mean|.| -> sigma, undo the Laplacian gain
+  return { lum: band(lum) * k, chroma: band(chr) * k };
+}
+
+function autoDenoise() {
+  const im = IM();
+  if (!im) { toast('Open a photo first'); return null; }
+  const n = measureNoise(im);
+  const s = im.s;
+  // floors: sensor read noise below these is not worth smoothing
+  // calibrated against underexposed high-ISO night frames: a lifted one measures
+  // around 3.5 / 3.0 and wants roughly 0.35 luminance, 0.55 colour
+  s.nrLum = +clamp((n.lum - 0.0012) * 150, 0, 0.75).toFixed(2);
+  s.nrColor = +clamp((n.chroma - 0.0010) * 260, 0, 0.90).toFixed(2);
+  // heavy smoothing needs a higher sharpening threshold or it re-etches the grain
+  if (s.sharpen > 0 && s.nrLum > 0.25) s.sharpDetail = Math.max(s.sharpDetail, 60);
+  syncAll();
+  requestRender(true);
+  toast(`Noise ${(n.lum * 1000).toFixed(1)} lum / ${(n.chroma * 1000).toFixed(1)} colour → NR ${s.nrLum} / ${s.nrColor}`);
+  return { n, applied: { nrLum: s.nrLum, nrColor: s.nrColor } };
+}
+
 /* ---------------- filmstrip ---------------- */
 function buildStrip() {
   const st = $('#strip'); st.innerHTML = '';
@@ -423,7 +507,7 @@ void main(){
 const FS_FINAL = `#version 300 es
 ${COMMON}
 #define MAXM 6
-uniform sampler2D uBase, uBlur, uLUT, uBrush0, uBrush1, uBrush2, uBrush3;
+uniform sampler2D uBase, uBlur, uBlur2, uLUT, uBrush0, uBrush1, uBrush2, uBrush3;
 uniform vec2 uTexel, uVS, uVO;
 uniform float uAspect, uSeed;
 uniform float uClarity, uTexture, uDehaze, uVib, uSat;
@@ -474,22 +558,32 @@ void main(){
   vec3 c = texture(uBase,v).rgb;
   vec3 low = texture(uBlur,v).rgb;
 
-  // --- noise reduction (edge aware) ---
+  // --- noise reduction: two rings for luminance, a chroma pyramid for colour ---
   if(uNrL>0.001){
-    vec3 acc = c; float ws = 1.; float lc = luma(c);
-    float sg = 0.02+0.28*uNrL;
+    float lc = luma(c);
+    float sg = 0.014 + 0.20*uNrL;
+    vec3 acc = c; float ws = 1.;
     for(int i=0;i<8;i++){
-      float a = float(i)*0.7853981;
-      vec3 s = texture(uBase, v+vec2(cos(a),sin(a))*uTexel*1.4).rgb;
-      float d = abs(luma(s)-lc); float w = exp(-d*d/(sg*sg));
-      acc += s*w; ws += w;
+      float a = float(i)*0.7853981 + 0.3927;
+      vec2 dir = vec2(cos(a),sin(a));
+      vec3 s1 = texture(uBase, v+dir*uTexel*1.5).rgb;
+      vec3 s2 = texture(uBase, v+dir*uTexel*3.1).rgb;
+      float d1 = luma(s1)-lc, d2 = luma(s2)-lc;
+      float w1 = exp(-d1*d1/(sg*sg));
+      float w2 = 0.55*exp(-d2*d2/(sg*sg));
+      acc += s1*w1 + s2*w2; ws += w1 + w2;
     }
-    c = mix(c, acc/ws, clamp(uNrL*1.1,0.,1.));
+    vec3 den = acc/ws;
+    // hand back a little fine detail so stars survive the smoothing
+    float keep = 0.16*(1.-clamp(uNrL,0.,1.));
+    c = mix(c, den + (c-den)*keep, clamp(uNrL*1.15,0.,1.));
   }
   if(uNrC>0.001){
-    float lc = luma(c), lb = luma(low);
-    vec3 chroma = low - vec3(lb);
-    c = mix(c, vec3(lc)+chroma, clamp(uNrC,0.,1.)*0.9);
+    float lc = luma(c);
+    vec3 coarse = texture(uBlur2, v).rgb;
+    vec3 ref = mix(low, coarse, clamp(uNrC*1.3-0.25,0.,1.));
+    vec3 chroma = ref - vec3(luma(ref));
+    c = mix(c, vec3(lc)+chroma, clamp(uNrC,0.,1.)*0.95);
   }
 
   // --- small-radius reference for texture / sharpen ---
@@ -752,12 +846,24 @@ function develop(im, vw, vh, VS_, VO_, forExport) {
   bindTarget(b2);
   gl.uniform1i(u.uTex, tex(0, b1.tex));
   gl.uniform2f(u.uDir, 0, fy); draw();
+  // a much coarser level: chroma blotches are low frequency and the quarter-res
+  // blur above is far too fine to reach them
+  const cw2 = Math.max(2, Math.round(vw / 16)), ch2 = Math.max(2, Math.round(vh / 16));
+  const b3 = fbo(forExport ? 'eb3' : 'b3', cw2, ch2, true);
+  const b4 = fbo(forExport ? 'eb4' : 'b4', cw2, ch2, true);
+  bindTarget(b3);
+  gl.uniform1i(u.uTex, tex(0, b2.tex));
+  gl.uniform2f(u.uDir, fx * 4.5, 0); draw();
+  bindTarget(b4);
+  gl.uniform1i(u.uTex, tex(0, b3.tex));
+  gl.uniform2f(u.uDir, 0, fy * 4.5); draw();
 
   // pass 3 : develop
   u = use(PROG.final);
   bindTarget(out);
   gl.uniform1i(u.uBase, tex(0, base.tex));
   gl.uniform1i(u.uBlur, tex(1, b2.tex));
+  gl.uniform1i(u.uBlur2, tex(7, b4.tex));
   gl.uniform1i(u.uLUT, tex(2, LUTTEX));
   for (let i = 0; i < MAXBRUSH; i++) gl.uniform1i(u['uBrush' + i], tex(3 + i, BRUSHTEX[i]));
   gl.uniform2f(u.uTexel, 1 / vw, 1 / vh);
@@ -908,6 +1014,11 @@ function buildPanels() {
     sl(b, 'sharpRadius', 'Radius', .5, 3, .05, 1);
     sl(b, 'sharpDetail', 'Detail', 0, 100, 1, 25, 'int');
     b.insertAdjacentHTML('beforeend', '<div class="divline"></div>');
+    const ag = document.createElement('div'); ag.className = 'grp';
+    const ab = document.createElement('div'); ab.className = 'chip';
+    ab.textContent = 'Auto denoise'; ab.title = 'Measure this frame and set both sliders';
+    ab.onclick = () => autoDenoise();
+    ag.append(ab); b.append(ag);
     sl(b, 'nrLum', 'Noise · luminance', 0, 1, .01, 0);
     sl(b, 'nrColor', 'Noise · color', 0, 1, .01, 0);
     b.insertAdjacentHTML('beforeend', '<div class="hint">Long exposures: start at 0.25 luminance, 0.4 color, then raise sharpening detail to protect stars.</div>');
@@ -1478,7 +1589,7 @@ function selectImage(i) {
 
 /* ---------------- export ---------------- */
 function freeExport() {
-  ['ebase', 'eb1', 'eb2', 'eout'].forEach(k => {
+  ['ebase', 'eb1', 'eb2', 'eb3', 'eb4', 'eout'].forEach(k => {
     const f = FBO[k]; if (f) { gl.deleteTexture(f.tex); gl.deleteFramebuffer(f.fb); delete FBO[k]; }
   });
 }
