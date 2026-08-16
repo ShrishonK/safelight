@@ -30,11 +30,36 @@ jobs:
         with:
           node-version: 20
       - run: npm install
-      # --publish never: build only. The release job below does the uploading,
-      # so three parallel jobs never fight over the same release.
-      - run: npm run ${{ matrix.script }} -- --publish never
+
+      # macOS gets its own step: hdiutil cannot reliably handle two disk images
+      # at once on the runners, so build one architecture at a time and retry.
+      - name: Build macOS installers
+        if: runner.os == 'macOS'
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: |
+          build_arch () {
+            for attempt in 1 2 3; do
+              echo "::group::$1 attempt $attempt"
+              npm run dist:mac -- --$1 --publish never && { echo "::endgroup::"; return 0; }
+              echo "::endgroup::"
+              echo "$1 build failed on attempt $attempt, cleaning up and retrying"
+              for vol in /Volumes/Safelight*; do
+                [ -d "$vol" ] && hdiutil detach "$vol" -force || true
+              done
+              sleep 20
+            done
+            return 1
+          }
+          build_arch arm64
+          build_arch x64
+
+      - name: Build installers
+        if: runner.os != 'macOS'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npm run ${{ matrix.script }} -- --publish never
+
       - uses: actions/upload-artifact@v4
         with:
           name: safelight-${{ matrix.os }}
