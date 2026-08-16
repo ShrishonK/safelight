@@ -1,10 +1,13 @@
 {
   "name": "safelight",
   "productName": "Safelight",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A fast raw and photo developer",
   "main": "main/main.js",
-  "author": "Shrishon",
+  "author": {
+    "name": "Shrishon",
+    "email": "ShrishonK@users.noreply.github.com"
+  },
   "license": "MIT",
   "private": true,
   "scripts": {

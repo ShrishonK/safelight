@@ -1,11 +1,15 @@
 name: Build installers
 
-# Push this repo to GitHub and every tag starting with v builds installers for
-# all three platforms. Download them from the Actions run, or from the release.
+# A tag starting with v builds installers on real macOS, Windows and Linux
+# machines, then attaches them to a GitHub Release.
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+
+# Without this the workflow token is read-only and publishing fails with 403.
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -13,11 +17,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest    # Apple Silicon + Intel .dmg
+          - os: macos-latest      # .dmg for Apple Silicon and Intel
             script: dist:mac
-          - os: windows-latest  # .exe setup wizard
+          - os: windows-latest    # .exe setup wizard
             script: dist:win
-          - os: ubuntu-latest   # AppImage + .deb
+          - os: ubuntu-latest     # AppImage + .deb
             script: dist:linux
     runs-on: ${{ matrix.os }}
     steps:
@@ -26,9 +30,10 @@ jobs:
         with:
           node-version: 20
       - run: npm install
-      - run: npm run ${{ matrix.script }}
+      # --publish never: build only. The release job below does the uploading,
+      # so three parallel jobs never fight over the same release.
+      - run: npm run ${{ matrix.script }} -- --publish never
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: false
       - uses: actions/upload-artifact@v4
         with:
@@ -39,3 +44,16 @@ jobs:
             dist/*.AppImage
             dist/*.deb
           if-no-files-found: warn
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
