@@ -138,7 +138,10 @@ ipcMain.handle('dialog:open', async () => {
     filters: [
       { name: 'All photos', extensions: [...STILL, ...RAW] },
       { name: 'Camera raw', extensions: RAW },
-      { name: 'Standard images', extensions: STILL }
+      { name: 'Standard images', extensions: STILL },
+      { name: 'Presets and settings', extensions: ['slpreset', 'slcar', 'json'] },
+      { name: 'Neural models', extensions: ['onnx', 'data', 'onnx_data'] },
+      { name: 'All files', extensions: ['*'] }
     ]
   });
   if (r.canceled) return [];

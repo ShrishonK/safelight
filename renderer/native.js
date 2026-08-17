@@ -142,8 +142,23 @@ function imageFromLinear(name, w, h, rgba, meta) {
 /* ---------- opening ---------- */
 const _loadFiles = loadFiles;
 window.loadFiles = async function (files) {
-  const list = [...files];
+  let list = [...files];
   const failed = [];
+
+  // model files arrive as a pair and install together rather than opening as photos
+  const modelFiles = list.filter(f => MODEL_RE.test(f.name) || /\.(data|bin)$/i.test(f.name));
+  if (modelFiles.length && typeof installModelFiles === 'function') {
+    list = list.filter(f => !modelFiles.includes(f));
+    try {
+      await busy('Installing the model');
+      const parts = [];
+      for (const f of modelFiles) parts.push({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) });
+      const r = await installModelFiles(parts);
+      toast(`Model ready: ${r.name} · ${r.mb} MB · ${AI.backend}`);
+    } catch (e) {
+      failed.push('model — ' + e.message);
+    } finally { busy(null); }
+  }
   for (const f of list) {
     const before = A.imgs.length;
     try {
@@ -331,6 +346,7 @@ function helpCard(info) {
    rotation or brush paint, so it can land on any photo.
    ============================================================ */
 const PRESET_RE = /\.(slpreset|json)$/i;
+const MODEL_RE = /\.(onnx|onnx\.data|onnx_data)$/i;
 
 const BUILTIN_PRESETS = [{
   name: 'Night portrait — cool sky, warm subject',
