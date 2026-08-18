@@ -14,7 +14,7 @@ const AI = {
   session: null,
   modelName: null,
   tile: 512,
-  overlap: 48,
+  overlap: 96,    // deep networks darken well beyond a few pixels at a tile edge
   cancel: false
 };
 
@@ -106,7 +106,7 @@ function tileToTensor(ort, rgba, W, H, x0, y0, tw, th) {
   const data = new Float32Array(3 * tw * th);
   const plane = tw * th;
   for (let y = 0; y < th; y++) {
-    const sy = Math.min(H - 1, y0 + y);
+    const sy = Math.min(H - 1, Math.max(0, y0 + y));
     for (let x = 0; x < tw; x++) {
       const sx = Math.min(W - 1, Math.max(0, x0 + x));
       const s = (sy * W + sx) * 4, d = y * tw + x;
@@ -132,8 +132,11 @@ async function runModel(rgba, W, H, onProgress) {
   if (!sess) throw new Error('no model loaded');
   const inName = sess.inputNames[0], outName = sess.outputNames[0];
   const OV = AI.overlap;
-  const T = Math.min(AI.tile, Math.max(64, W + 2 * OV), Math.max(64, H + 2 * OV));
-  const step = Math.max(32, T - OV * 2);
+  // Networks with several downsampling stages need sides that are a multiple of 64,
+  // or they return a differently sized tensor and everything after this is garbage.
+  const round64 = n => Math.max(64, Math.ceil(n / 64) * 64);
+  const T = Math.min(round64(AI.tile), round64(Math.max(W, H) + 2 * OV));
+  const step = Math.max(64, T - OV * 2);
 
   // Tiles overhang the frame by the overlap and sample replicated edge pixels.
   // Convolutions zero-pad internally, which darkens the outermost pixels of every
@@ -154,7 +157,8 @@ async function runModel(rgba, W, H, onProgress) {
       if (AI.cancel) throw new Error('cancelled');
       const input = tileToTensor(ort, rgba, W, H, x0, y0, T, T);
       const res = await sess.run({ [inName]: input });
-      const o = res[outName].data, plane = T * T;
+      const tensor = res[outName];
+      const o = tensor.data, plane = T * T;
       for (let y = 0; y < T; y++) {
         const gy = y0 + y;
         if (gy < 0 || gy >= H) continue;
@@ -175,10 +179,17 @@ async function runModel(rgba, W, H, onProgress) {
       await new Promise(r => setTimeout(r, 0));   // let the UI breathe
     }
   }
-  for (let i = 0, p = 0; i < W * H; i++, p += 3) {
-    const w = wsum[i] || 1;
-    acc[p] /= w; acc[p + 1] /= w; acc[p + 2] /= w;
+  let repaired = 0;
+  for (let i = 0, p = 0, q = 0; i < W * H; i++, p += 3, q += 4) {
+    const w = wsum[i];
+    for (let ch = 0; ch < 3; ch++) {
+      const v = w > 0 ? acc[p + ch] / w : NaN;
+      // never leave a hole: anything uncovered or non-finite keeps the original pixel
+      if (Number.isFinite(v)) acc[p + ch] = v;
+      else { acc[p + ch] = rgba[q + ch] / 255; repaired++; }
+    }
   }
+  if (repaired) console.warn('denoise: kept source pixels for', repaired / 3, 'px');
   return acc;
 }
 
