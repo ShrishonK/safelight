@@ -49,14 +49,38 @@ header{
 .spacer{flex:1}
 .stat{font:400 11px/1 var(--mono);color:var(--dim);white-space:nowrap}
 
-main{display:grid;grid-template-columns:76px 1fr 322px;min-height:0}
+main{display:grid;grid-template-columns:232px 1fr 322px;min-height:0}
 
 /* ---------- filmstrip ---------- */
-#strip{background:var(--panel);border-right:1px solid var(--line);overflow-y:auto;padding:6px}
+#side{background:var(--panel);border-right:1px solid var(--line);display:grid;
+  grid-template-rows:auto auto 1fr;grid-template-columns:minmax(0,1fr);
+  min-height:0;min-width:0;overflow:hidden}
+#fbar{display:flex;align-items:center;gap:4px;padding:6px;border-bottom:1px solid var(--line)}
+#fbar .tb{padding:4px 7px;font-size:11px}
+#crumb{flex:1;font:400 10px/1.3 var(--mono);color:var(--dim);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+#crumb:hover{color:var(--text)}
+#tree{max-height:34vh;overflow-y:auto;border-bottom:1px solid var(--line);padding:4px 0}
+#tree:empty{display:none}
+.frow{display:flex;align-items:center;gap:6px;padding:4px 8px;font-size:12px;cursor:pointer;color:var(--dim)}
+.frow:hover{background:var(--panel-2);color:var(--text)}
+.frow .ic{color:var(--amber);font-size:11px;opacity:.85}
+.frow .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.frow .ct{margin-left:auto;font:400 9px var(--mono);color:var(--faint)}
+#strip{overflow-y:auto;overflow-x:hidden;padding:6px;display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;align-content:start;min-width:0}
+#strip .thumb{min-width:0}
+#strip.list{grid-template-columns:minmax(0,1fr)}
 .thumb{
-  position:relative;width:100%;aspect-ratio:3/2;margin-bottom:6px;border:1px solid var(--line);
+  position:relative;width:100%;aspect-ratio:3/2;border:1px solid var(--line);
   border-radius:var(--r);overflow:hidden;cursor:pointer;background:var(--sunk);
 }
+.thumb.loading::after{content:"";position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.045),transparent);
+  animation:sweep 1.2s linear infinite}
+@keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
+.thumb .open{position:absolute;top:3px;left:3px;width:5px;height:5px;border-radius:50%;
+  background:#5ac8fa;box-shadow:0 0 0 1px rgba(0,0,0,.5)}
 .thumb img{width:100%;height:100%;object-fit:cover;display:block}
 .thumb.sel{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber-dim)}
 .thumb .edited{position:absolute;top:3px;right:3px;width:5px;height:5px;border-radius:50%;background:var(--amber)}
@@ -125,6 +149,7 @@ input[type=range]:hover::-webkit-slider-thumb{background:var(--amber)}
 
 /* histogram + curve */
 #histo{width:100%;height:78px;display:block;background:var(--sunk);border:1px solid var(--line);border-radius:var(--r)}
+canvas.wheel{width:100%;aspect-ratio:1;display:block;margin:6px 0 4px;cursor:crosshair;touch-action:none}
 #curve{width:100%;aspect-ratio:1;display:block;background:var(--sunk);border:1px solid var(--line);
   border-radius:var(--r);cursor:crosshair;touch-action:none}
 .chwrap{display:flex;gap:4px;margin:8px 0 6px}
@@ -159,9 +184,12 @@ input[type=range]:hover::-webkit-slider-thumb{background:var(--amber)}
 select,input[type=text],input[type=number]{
   background:var(--sunk);border:1px solid var(--line);border-radius:var(--r);padding:4px 6px;
   font:400 11px var(--mono);min-width:110px}
+@media (max-width:1200px){
+  main{grid-template-columns:170px 1fr 300px}
+}
 @media (max-width:900px){
   main{grid-template-columns:0 1fr 280px}
-  #strip{display:none}
+  #side{display:none}
 }
 
 #busy{position:fixed;inset:0;background:rgba(8,11,15,.82);display:none;place-items:center;z-index:80}
@@ -196,7 +224,15 @@ body.mac header{padding-left:82px}
 </header>
 
 <main>
-  <aside id="strip"><div class="striphint">Filmstrip<br>drop files anywhere</div></aside>
+  <aside id="side">
+    <div id="fbar">
+      <button class="tb" id="btnFolder" title="Open a folder (Ctrl+Shift+O)">Folder…</button>
+      <button class="tb" id="btnUp" title="Go up a folder">↑</button>
+      <div id="crumb">no folder open</div>
+    </div>
+    <div id="tree"></div>
+    <div id="strip"><div class="striphint">Drop a folder here<br>or click Folder…</div></div>
+  </aside>
 
   <section id="stage">
     <canvas id="gl"></canvas>
@@ -219,5 +255,7 @@ body.mac header{padding-left:82px}
 <script src="app.js"></script>
 <script src="native.js"></script>
 <script src="ai.js"></script>
+<script src="folder.js"></script>
+<script src="exif.js"></script>
 </body>
 </html>

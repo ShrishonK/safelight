@@ -73,6 +73,10 @@ function buildMenu() {
     label: 'File',
     submenu: [
       { label: 'Open photos…', accelerator: 'CmdOrCtrl+O', click: menuSend('open') },
+      { label: 'Open folder…', accelerator: 'CmdOrCtrl+Shift+O', click: menuSend('open-folder') },
+      { label: 'Go up a folder', accelerator: 'CmdOrCtrl+Up', click: menuSend('folder-up') },
+      { label: 'Close folder', click: menuSend('close-folder') },
+      { label: 'Reveal photo in file manager', click: menuSend('reveal') },
       { label: 'Close photo', accelerator: 'CmdOrCtrl+W', click: menuSend('close-photo') },
       { type: 'separator' },
       { label: 'Export photo…', accelerator: 'CmdOrCtrl+E', click: menuSend('export') },
@@ -184,6 +188,35 @@ ipcMain.handle('file:write', (_e, { dir, name, bytes }) => {
   return p;
 });
 
+ipcMain.handle('folder:scan', (_e, dir) => {
+  const exts = new Set([...STILL, ...RAW]);
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch (e) { return { error: e.message, dir }; }
+  const folders = entries
+    .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+    .map(e => ({ name: e.name, path: path.join(dir, e.name) }))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  const files = entries
+    .filter(e => e.isFile() && exts.has(path.extname(e.name).slice(1).toLowerCase()))
+    .map(e => ({ name: e.name, path: path.join(dir, e.name) }))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  const parent = path.dirname(dir);
+  return { dir, name: path.basename(dir) || dir, parent: parent === dir ? null : parent, folders, files };
+});
+
+ipcMain.handle('folder:pick', async () => {
+  const st = readStore();
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Open a folder of photos',
+    properties: ['openDirectory'],
+    defaultPath: st.lastFolder || app.getPath('pictures')
+  });
+  if (r.canceled || !r.filePaths[0]) return null;
+  st.lastFolder = r.filePaths[0]; writeStore(st);
+  return r.filePaths[0];
+});
+
 ipcMain.handle('store:get', () => readStore());
 ipcMain.handle('store:set', (_e, obj) => { writeStore(Object.assign(readStore(), obj)); return true; });
 ipcMain.handle('app:info', () => ({ version: app.getVersion(), platform: process.platform, electron: process.versions.electron }));
@@ -200,6 +233,9 @@ else {
   });
   app.on('open-file', (e, p) => {          // macOS: double-click / drop on the dock icon
     e.preventDefault();
+    try {
+      if (fs.statSync(p).isDirectory()) { send('open-folder', p); return; }
+    } catch (err) { return; }
     const f = readOne(p); if (!f) return;
     if (win && !win.isDestroyed()) send('open-files', [f]); else queued.push(f);
   });

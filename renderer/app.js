@@ -28,7 +28,7 @@ function defaults() {
     // hsl
     hslH: new Array(8).fill(0), hslS: new Array(8).fill(0), hslL: new Array(8).fill(0),
     // color grading
-    shHue: 220, shSat: 0, miHue: 0, miSat: 0, hiHue: 40, hiSat: 0, cgBal: 0,
+    shHue: 220, shSat: 0, shLum: 0, miHue: 0, miSat: 0, miLum: 0, hiHue: 40, hiSat: 0, hiLum: 0, cgBal: 0, cgBlend: 50,
     // detail
     sharpen: 0, sharpRadius: 1.0, sharpDetail: 25, nrLum: 0, nrColor: 0, nrDetail: 50,
     // effects
@@ -39,7 +39,7 @@ function defaults() {
 }
 
 function defMaskAdj() {
-  return { exposure: 0, contrast: 0, highlights: 0, shadows: 0, saturation: 0, temp: 0, tint: 0, texture: 0 };
+  return { exposure: 0, contrast: 0, highlights: 0, shadows: 0, saturation: 0, temp: 0, tint: 0, texture: 0, nr: 1, sharp: 1 };
 }
 
 function newMask(type, w, h) {
@@ -384,6 +384,85 @@ function autoDenoise() {
   return { n, applied: { nrLum: s.nrLum, nrColor: s.nrColor } };
 }
 
+
+/* ---------------- colour grading wheels ---------------- */
+function buildWheel(host) {
+  if (!host) return;
+  clearGroup('cg'); host.innerHTML = '';
+  const k = A.cgRange || 'sh';
+  const cv = document.createElement('canvas');
+  cv.className = 'wheel'; cv.width = 320; cv.height = 320;
+  host.append(cv);
+  const sliders = document.createElement('div'); host.append(sliders);
+  sl(sliders, k + 'Lum', 'Luminance', -100, 100, 1, 0, 'int', () => S(), 'cg');
+  sl(sliders, k + 'Sat', 'Saturation', 0, 100, 1, 0, 'int', () => S(), 'cg');
+
+  const draw = () => {
+    const g = cv.getContext('2d'), R = 160, cx = 160, cy = 160;
+    g.clearRect(0, 0, 320, 320);
+    // hue around, saturation outward
+    const img = g.createImageData(320, 320);
+    for (let y = 0; y < 320; y++) for (let x = 0; x < 320; x++) {
+      const dx = x - cx, dy = y - cy, r = Math.hypot(dx, dy);
+      const i = (y * 320 + x) * 4;
+      if (r > R) { img.data[i + 3] = 0; continue; }
+      const hue = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
+      const sat = Math.min(1, r / R);
+      const c = hsv2rgbJS(hue, sat * 0.92, 1);
+      img.data[i] = c[0] * 255; img.data[i + 1] = c[1] * 255; img.data[i + 2] = c[2] * 255;
+      img.data[i + 3] = 255 * Math.min(1, (R - r) / 2);      // soft rim
+    }
+    g.putImageData(img, 0, 0);
+    // darken toward the middle so the neutral centre reads as neutral
+    const grd = g.createRadialGradient(cx, cy, 0, cx, cy, R);
+    grd.addColorStop(0, 'rgba(13,17,22,.92)');
+    grd.addColorStop(.55, 'rgba(13,17,22,0)');
+    g.globalCompositeOperation = 'source-atop';
+    g.fillStyle = grd; g.beginPath(); g.arc(cx, cy, R, 0, 6.2832); g.fill();
+    g.globalCompositeOperation = 'source-over';
+    g.strokeStyle = 'rgba(255,255,255,.10)'; g.lineWidth = 1;
+    g.beginPath(); g.arc(cx, cy, R - .5, 0, 6.2832); g.stroke();
+    g.beginPath(); g.arc(cx, cy, R * .5, 0, 6.2832); g.stroke();
+    // the puck
+    const s = S(), hue = s[k + 'Hue'] || 0, sat = (s[k + 'Sat'] || 0) / 100;
+    const px = cx + Math.cos(hue * Math.PI / 180) * sat * R;
+    const py = cy + Math.sin(hue * Math.PI / 180) * sat * R;
+    g.beginPath(); g.moveTo(cx, cy); g.lineTo(px, py);
+    g.strokeStyle = 'rgba(255,255,255,.28)'; g.stroke();
+    const col = hsv2rgbJS(hue, sat * .92, 1);
+    g.beginPath(); g.arc(px, py, 11, 0, 6.2832);
+    g.fillStyle = `rgb(${col.map(v => Math.round(v * 255)).join(',')})`;
+    g.strokeStyle = '#0d1116'; g.lineWidth = 3; g.fill(); g.stroke();
+    g.strokeStyle = 'rgba(255,255,255,.85)'; g.lineWidth = 1.5; g.stroke();
+  };
+
+  const set = (ev) => {
+    const r = cv.getBoundingClientRect();
+    const dx = (ev.clientX - r.left) / r.width * 320 - 160;
+    const dy = (ev.clientY - r.top) / r.height * 320 - 160;
+    const s = S();
+    s[k + 'Hue'] = Math.round(((Math.atan2(dy, dx) * 180 / Math.PI) + 360) % 360);
+    s[k + 'Sat'] = Math.round(clamp(Math.hypot(dx, dy) / 160, 0, 1) * 100);
+    ctrls.forEach(c => c.sync && c.sync());
+    draw(); requestRender(false);
+  };
+  cv.addEventListener('pointerdown', e => {
+    if (A.cur < 0) return;
+    e.preventDefault(); cv.setPointerCapture(e.pointerId); set(e);
+    const mv = ev => set(ev);
+    const up = () => { cv.removeEventListener('pointermove', mv); cv.removeEventListener('pointerup', up); requestRender(true); };
+    cv.addEventListener('pointermove', mv); cv.addEventListener('pointerup', up);
+  });
+  cv.addEventListener('dblclick', () => {
+    const s = S();
+    s[k + 'Sat'] = 0; s[k + 'Lum'] = 0;
+    ctrls.forEach(c => c.sync && c.sync());
+    draw(); requestRender(true);
+  });
+  const o = { grp: 'cg', sync: draw };
+  ctrls.push(o); draw();
+}
+
 /* ---------------- filmstrip ---------------- */
 function buildStrip() {
   const st = $('#strip'); st.innerHTML = '';
@@ -516,11 +595,11 @@ uniform float uAspect, uSeed;
 uniform float uClarity, uTexture, uDehaze, uVib, uSat;
 uniform float uSharp, uSharpR, uSharpD, uNrL, uNrC, uNrD;
 uniform float uVig, uVigF, uVigR, uGrain, uGrainS;
-uniform vec3 uCGs, uCGm, uCGh; uniform float uCGbal;
+uniform vec3 uCGs, uCGm, uCGh; uniform float uCGbal; uniform vec3 uCGlum;
 uniform float uHslH[8], uHslS[8], uHslL[8], uHslC[8];
 uniform int uMCount, uShowMask;
 uniform float uMType[MAXM];
-uniform vec4 uMGeoA[MAXM], uMGeoB[MAXM], uMAdjA[MAXM], uMAdjB[MAXM], uMFlags[MAXM];
+uniform vec4 uMGeoA[MAXM], uMGeoB[MAXM], uMAdjA[MAXM], uMAdjB[MAXM], uMAdjC[MAXM], uMFlags[MAXM];
 in vec2 v; out vec4 o;
 
 float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
@@ -561,10 +640,25 @@ void main(){
   vec3 c = texture(uBase,v).rgb;
   vec3 low = texture(uBlur,v).rgb;
 
+  // Mask weights are needed before denoising, not after: a mask can scale how
+  // much noise reduction and sharpening reach its region, so a subject can be
+  // left crisp while the sky behind it is smoothed hard.
+  float mw[MAXM];
+  float nrScale = 1.0, shScale = 1.0;
+  for(int i=0;i<MAXM;i++){
+    mw[i] = 0.0;
+    if(i>=uMCount) continue;
+    mw[i] = maskW(i, iuv, c);
+    nrScale *= mix(1.0, uMAdjC[i].x, mw[i]);
+    shScale *= mix(1.0, uMAdjC[i].y, mw[i]);
+  }
+  float nrL = clamp(uNrL*nrScale, 0.0, 1.0);
+  float nrC = clamp(uNrC*nrScale, 0.0, 1.0);
+
   // --- noise reduction: two rings for luminance, a chroma pyramid for colour ---
-  if(uNrL>0.001){
+  if(nrL>0.001){
     float lc = luma(c);
-    float sg = 0.014 + 0.20*uNrL;
+    float sg = 0.014 + 0.20*nrL;
     vec3 acc = c; float ws = 1.;
     for(int i=0;i<8;i++){
       float a = float(i)*0.7853981 + 0.3927;
@@ -583,19 +677,19 @@ void main(){
     // instead of being averaged away.
     vec3 d = c - den;
     float dl = luma(d);
-    float thr = (0.004 + 0.02*uNrL) * (1.0 - 0.92*uNrD);
+    float thr = (0.004 + 0.02*nrL) * (1.0 - 0.92*uNrD);
     float keep = max(abs(dl) - thr, 0.0);
     float scale = abs(dl) > 1e-6 ? keep/abs(dl) : 0.0;
     // a floor so heavily smoothed areas keep some microtexture and don't go plastic
     scale = max(scale, 0.10*uNrD);
     c = den + d*scale;
   }
-  if(uNrC>0.001){
+  if(nrC>0.001){
     float lc = luma(c);
     vec3 coarse = texture(uBlur2, v).rgb;
-    vec3 ref = mix(low, coarse, clamp(uNrC*1.3-0.25,0.,1.));
+    vec3 ref = mix(low, coarse, clamp(nrC*1.3-0.25,0.,1.));
     vec3 chroma = ref - vec3(luma(ref));
-    c = mix(c, vec3(lc)+chroma, clamp(uNrC,0.,1.)*0.95);
+    c = mix(c, vec3(lc)+chroma, clamp(nrC,0.,1.)*0.95);
   }
 
   // --- small-radius reference for texture / sharpen ---
@@ -606,7 +700,7 @@ void main(){
   // --- masks (local adjustments, linear light) ---
   for(int i=0;i<MAXM;i++){
     if(i>=uMCount) break;
-    float w = maskW(i, iuv, c);
+    float w = mw[i];
     if(w<=0.001) continue;
     vec4 a = uMAdjA[i], b = uMAdjB[i];
     vec3 mc = toneOps(c, a.x, a.y, a.z, a.w, b.x, b.y, b.z);
@@ -631,10 +725,10 @@ void main(){
   if(uTexture!=0.) c = max(c+(c-sm)*uTexture*1.8, 0.);
 
   // --- sharpen (unsharp with detail threshold) ---
-  if(uSharp>0.001){
+  if(uSharp*shScale>0.001){
     vec3 hi = c-sm;
     float e = clamp((abs(luma(hi))-0.004*(1.-uSharpD))*24.,0.,1.);
-    c = max(c + hi*uSharp*2.2*mix(1.,e,uSharpD), 0.);
+    c = max(c + hi*uSharp*shScale*2.2*mix(1.,e,uSharpD), 0.);
   }
 
   // --- to display space ---
@@ -669,12 +763,14 @@ void main(){
   }
 
   // --- color grading ---
-  if(uCGs!=vec3(0.)||uCGm!=vec3(0.)||uCGh!=vec3(0.)){
+  if(uCGs!=vec3(0.)||uCGm!=vec3(0.)||uCGh!=vec3(0.)||uCGlum!=vec3(0.)){
     float L = clamp(luma(d)+uCGbal*0.3,0.,1.);
     float ws = 1.-smoothstep(0.0,0.55,L);
     float wh = smoothstep(0.45,1.0,L);
     float wm = clamp(1.-ws-wh,0.,1.);
     d = clamp(d + uCGs*ws + uCGm*wm + uCGh*wh, 0., 1.);
+    float lift = uCGlum.x*ws + uCGlum.y*wm + uCGlum.z*wh;
+    if(lift!=0.) d = clamp(d + lift*0.25*(1.-abs(luma(d)*2.-1.)*0.4), 0., 1.);
   }
 
   // --- vibrance / saturation ---
@@ -894,6 +990,7 @@ function develop(im, vw, vh, VS_, VO_, forExport) {
   gl.uniform3fv(u.uCGm, cg(s.miHue, s.miSat));
   gl.uniform3fv(u.uCGh, cg(s.hiHue, s.hiSat));
   gl.uniform1f(u.uCGbal, s.cgBal / 100);
+  gl.uniform3fv(u.uCGlum, new Float32Array([(s.shLum || 0) / 100, (s.miLum || 0) / 100, (s.hiLum || 0) / 100]));
   gl.uniform1fv(u.uHslC, new Float32Array([0,30,60,120,180,240,285,330]));
   gl.uniform1fv(u.uHslH, new Float32Array(s.hslH));
   gl.uniform1fv(u.uHslS, new Float32Array(s.hslS));
@@ -901,7 +998,8 @@ function develop(im, vw, vh, VS_, VO_, forExport) {
   // masks
   const n = Math.min(s.masks.length, MAXM);
   const ty = new Float32Array(MAXM), ga = new Float32Array(MAXM * 4), gb = new Float32Array(MAXM * 4),
-    aa = new Float32Array(MAXM * 4), ab = new Float32Array(MAXM * 4), fl = new Float32Array(MAXM * 4);
+    aa = new Float32Array(MAXM * 4), ab = new Float32Array(MAXM * 4),
+    ac = new Float32Array(MAXM * 4), fl = new Float32Array(MAXM * 4);
   const TY = { linear: 1, radial: 2, brush: 3, lum: 4, color: 5 };
   for (let i = 0; i < n; i++) {
     const m = s.masks[i], g = m.geo, a = m.adj;
@@ -912,11 +1010,14 @@ function develop(im, vw, vh, VS_, VO_, forExport) {
     else if (m.type === 'color') { ga.set([g.hue, g.tol, 0, 0], i * 4); gb.set([g.satMin, 0, 0, 0], i * 4); }
     aa.set([a.exposure, a.contrast, a.highlights, a.shadows], i * 4);
     ab.set([a.saturation, a.temp, a.tint, a.texture], i * 4);
+    // presets written before these existed leave them undefined; 1 = unchanged
+    ac.set([a.nr === undefined ? 1 : a.nr, a.sharp === undefined ? 1 : a.sharp, 0, 0], i * 4);
     fl.set([m.invert ? 1 : 0, m.opacity / 100, Math.max(0, m.brush), 0], i * 4);
   }
   gl.uniform1i(u.uMCount, n);
   gl.uniform1fv(u.uMType, ty); gl.uniform4fv(u.uMGeoA, ga); gl.uniform4fv(u.uMGeoB, gb);
-  gl.uniform4fv(u.uMAdjA, aa); gl.uniform4fv(u.uMAdjB, ab); gl.uniform4fv(u.uMFlags, fl);
+  gl.uniform4fv(u.uMAdjA, aa); gl.uniform4fv(u.uMAdjB, ab);
+  gl.uniform4fv(u.uMAdjC, ac); gl.uniform4fv(u.uMFlags, fl);
   const showing = (!forExport && A.selMask >= 0 && A.showMask && A.selMask < n) ? A.selMask : -1;
   gl.uniform1i(u.uShowMask, showing);
   draw();
@@ -1012,14 +1113,29 @@ function buildPanels() {
   });
 
   mkSection(P, 'Color grading', false, b => {
-    b.insertAdjacentHTML('beforeend', '<div class="hint">Shadows</div>');
-    sl(b, 'shHue', 'Hue', 0, 360, 1, 220, 'int'); sl(b, 'shSat', 'Saturation', 0, 100, 1, 0, 'int');
-    b.insertAdjacentHTML('beforeend', '<div class="divline"></div><div class="hint">Midtones</div>');
-    sl(b, 'miHue', 'Hue', 0, 360, 1, 0, 'int'); sl(b, 'miSat', 'Saturation', 0, 100, 1, 0, 'int');
-    b.insertAdjacentHTML('beforeend', '<div class="divline"></div><div class="hint">Highlights</div>');
-    sl(b, 'hiHue', 'Hue', 0, 360, 1, 40, 'int'); sl(b, 'hiSat', 'Saturation', 0, 100, 1, 0, 'int');
-    b.insertAdjacentHTML('beforeend', '<div class="divline"></div>');
-    sl(b, 'cgBal', 'Balance', -100, 100, 1, 0, 'int');
+    const tabs = document.createElement('div'); tabs.className = 'chwrap';
+    const host = document.createElement('div'); host.id = 'cgHost';
+    const RANGES = [['sh', 'Shadows'], ['mi', 'Midtones'], ['hi', 'Highlights']];
+    A.cgRange = A.cgRange || 'sh';
+    RANGES.forEach(([k, label]) => {
+      const c = document.createElement('div');
+      c.className = 'chip' + (k === A.cgRange ? ' on' : '');
+      c.textContent = label;
+      c.onclick = () => {
+        A.cgRange = k;
+        [...tabs.children].forEach(x => x.classList.remove('on'));
+        c.classList.add('on');
+        buildWheel(host);
+      };
+      tabs.append(c);
+    });
+    b.append(tabs, host);
+    buildWheel(host);
+    const tail = document.createElement('div'); b.append(tail);
+    sl(tail, 'cgBal', 'Balance', -100, 100, 1, 0, 'int');
+    sl(tail, 'cgBlend', 'Blending', 0, 100, 1, 50, 'int');
+    b.insertAdjacentHTML('beforeend',
+      '<div class="hint">Drag inside the wheel: angle sets hue, distance from centre sets strength. Double-click the wheel to reset it.</div>');
   });
 
   mkSection(P, 'Detail', false, b => {
@@ -1146,6 +1262,10 @@ function rebuildMasks() {
   sl(host, 'temp', 'Temperature', -100, 100, 1, 0, 'int', A_, 'mask');
   sl(host, 'tint', 'Tint', -100, 100, 1, 0, 'int', A_, 'mask');
   sl(host, 'texture', 'Texture', -1, 1, .01, 0, 'f2', A_, 'mask');
+  host.insertAdjacentHTML('beforeend', '<div class="divline"></div>');
+  sl(host, 'nr', 'Denoise ×', 0, 2, .05, 1, 'f2', A_, 'mask');
+  sl(host, 'sharp', 'Sharpen ×', 0, 2, .05, 1, 'f2', A_, 'mask');
+  host.insertAdjacentHTML('beforeend', '<div class="hint">Denoise 0 leaves this region untouched by noise reduction; 2 doubles it. Put a mask on your subject at 0 and the sky stays smooth while he stays sharp.</div>');
   drawOverlay();
 }
 

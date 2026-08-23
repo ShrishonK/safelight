@@ -82,7 +82,8 @@ async function decodeRaw(name, bytes, half) {
     const txt = window.dcraw(bytes, { verbose: true, identify: true });
     if (typeof txt === 'string') {
       const g = k => (txt.match(new RegExp(k + ':\\s*(.+)')) || [, ''])[1].trim();
-      meta = { camera: g('Camera'), iso: g('ISO speed'), shutter: g('Shutter'), aperture: g('Aperture'), lens: g('Focal length') };
+      meta = { camera: g('Camera'), iso: g('ISO speed'), shutter: g('Shutter'),
+               aperture: g('Aperture'), focal: g('Focal length'), timestamp: g('Timestamp') };
     }
   } catch (e) { /* metadata is a nicety, not a requirement */ }
 
@@ -530,6 +531,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     const has = A.cur >= 0;
     switch (cmd) {
       case 'open': openNative(); break;
+      case 'open-folder': (async () => { const d = await N.pickFolder(); if (d) openFolder(d); })(); break;
+      case 'folder-up': if (FOLDER.parent) openFolder(FOLDER.parent); break;
+      case 'close-folder': closeFolder(); break;
+      case 'reveal': { const im = IM(); if (im && im.path) N.reveal(im.path); else if (FOLDER.dir) N.reveal(FOLDER.dir); } break;
       case 'close-photo':
         if (!has) break;
         A.imgs.splice(A.cur, 1);
@@ -557,8 +562,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         document.getElementById('btnBefore').classList.toggle('on', A.before);
         requestRender(false); break;
       case 'overlay': A.showMask = !A.showMask; rebuildMasks(); requestRender(true); break;
-      case 'next': selectImage(A.cur + 1); break;
-      case 'prev': selectImage(A.cur - 1); break;
+      case 'next': if (!stepPhoto(1)) selectImage(A.cur + 1); break;
+      case 'prev': if (!stepPhoto(-1)) selectImage(A.cur - 1); break;
       case 'help': helpCard(info); break;
     }
   });
