@@ -83,6 +83,8 @@ function buildMenu() {
       { label: 'Export all photos…', accelerator: 'CmdOrCtrl+Shift+E', click: menuSend('export-all') },
       { type: 'separator' },
       { label: 'Convert raw to .fedr…', click: menuSend('convert-raw') },
+      { type: 'separator' },
+      { label: 'Select subject', accelerator: 'CmdOrCtrl+Shift+S', click: menuSend('select-subject') },
       { label: 'Save settings sidecar…', click: menuSend('save-sidecar') },
       { label: 'Load settings sidecar…', click: menuSend('load-sidecar') },
       { type: 'separator' },
@@ -215,6 +217,14 @@ ipcMain.handle('folder:pick', async () => {
   if (r.canceled || !r.filePaths[0]) return null;
   st.lastFolder = r.filePaths[0]; writeStore(st);
   return r.filePaths[0];
+});
+
+ipcMain.handle('asset:read', (_e, rel) => {
+  // only ever from the app's own renderer directory
+  const base = path.join(__dirname, '..', 'renderer');
+  const p = path.normalize(path.join(base, rel));
+  if (!p.startsWith(base)) return null;
+  try { return { bytes: fs.readFileSync(p) }; } catch (e) { return null; }
 });
 
 ipcMain.handle('store:get', () => readStore());

@@ -43,7 +43,8 @@ function defMaskAdj() {
 }
 
 function newMask(type, w, h) {
-  const m = { id: idc(), type, name: '', invert: false, opacity: 100, adj: defMaskAdj(), brush: -1, show: true };
+  const m = { id: idc(), type, name: '', invert: false, opacity: 100, adj: defMaskAdj(), brush: -1, show: true,
+    sub: [], inter: [], helper: false };
   if (type === 'linear') m.geo = { x0: .5, y0: .25, x1: .5, y1: .75 };
   if (type === 'radial') m.geo = { cx: .5, cy: .5, rx: .28, ry: .28, ang: 0, feather: 50 };
   if (type === 'lum') m.geo = { lo: 0, hi: .35, feather: .12 };
@@ -74,6 +75,8 @@ function toast(msg) {
 const ctrls = [];
 
 function fmtVal(spec, v) {
+  // settings written before a slider existed have no value for it
+  if (typeof v !== 'number' || !isFinite(v)) v = spec.def;
   if (spec.fmt === 'int') return String(Math.round(v));
   if (spec.fmt === 'deg') return v.toFixed(1) + '°';
   return v.toFixed(2);
@@ -90,7 +93,13 @@ function mkSlider(parent, spec) {
   rng.min = spec.min; rng.max = spec.max; rng.step = spec.step;
   sr.append(rng); parent.append(row, sr);
 
-  const get = () => { const o = spec.scope(); return o ? o[spec.k] : spec.def; };
+  const get = () => {
+    const o = spec.scope();
+    if (!o) return spec.def;
+    const v = o[spec.k];
+    if (typeof v !== 'number' || !isFinite(v)) { o[spec.k] = spec.def; return spec.def; }
+    return v;
+  };
   const set = (v, commit) => {
     const o = spec.scope(); if (!o) return;
     o[spec.k] = clamp(v, spec.min, spec.max);
@@ -644,13 +653,28 @@ void main(){
   // much noise reduction and sharpening reach its region, so a subject can be
   // left crisp while the sky behind it is smoothed hard.
   float mw[MAXM];
+  for(int i=0;i<MAXM;i++) mw[i] = (i<uMCount) ? maskW(i, iuv, c) : 0.0;
+  // composition: a mask can have others subtracted from it or intersected with
+  // it, which is how you put a gradient behind a subject
+  float mc[MAXM];
+  for(int i=0;i<MAXM;i++){
+    float w = mw[i];
+    if(i<uMCount && w>0.0){
+      int sub = int(uMFlags[i].w + 0.5), inter = int(uMAdjC[i].w + 0.5);
+      for(int j=0;j<MAXM;j++){
+        if(j>=uMCount || j==i) continue;
+        int bit = 1 << j;
+        if((sub & bit) != 0) w *= (1.0 - mw[j]);
+        if((inter & bit) != 0) w *= mw[j];
+      }
+    }
+    mc[i] = w;
+  }
   float nrScale = 1.0, shScale = 1.0;
   for(int i=0;i<MAXM;i++){
-    mw[i] = 0.0;
-    if(i>=uMCount) continue;
-    mw[i] = maskW(i, iuv, c);
-    nrScale *= mix(1.0, uMAdjC[i].x, mw[i]);
-    shScale *= mix(1.0, uMAdjC[i].y, mw[i]);
+    if(i>=uMCount || uMAdjC[i].z > 0.5) continue;      // helpers only shape other masks
+    nrScale *= mix(1.0, uMAdjC[i].x, mc[i]);
+    shScale *= mix(1.0, uMAdjC[i].y, mc[i]);
   }
   float nrL = clamp(uNrL*nrScale, 0.0, 1.0);
   float nrC = clamp(uNrC*nrScale, 0.0, 1.0);
@@ -700,7 +724,8 @@ void main(){
   // --- masks (local adjustments, linear light) ---
   for(int i=0;i<MAXM;i++){
     if(i>=uMCount) break;
-    float w = mw[i];
+    if(uMAdjC[i].z > 0.5) continue;                    // helper: shapes others, paints nothing
+    float w = mc[i];
     if(w<=0.001) continue;
     vec4 a = uMAdjA[i], b = uMAdjB[i];
     vec3 mc = toneOps(c, a.x, a.y, a.z, a.w, b.x, b.y, b.z);
@@ -797,7 +822,7 @@ void main(){
   }
 
   if(uShowMask>=0){
-    float w = maskW(uShowMask, iuv, c);
+    float w = mc[uShowMask];
     d = mix(d*0.55, vec3(0.94,0.30,0.22), w*0.62);
   }
   o = vec4(d,1.);
@@ -1012,7 +1037,17 @@ function develop(im, vw, vh, VS_, VO_, forExport) {
     ab.set([a.saturation, a.temp, a.tint, a.texture], i * 4);
     // presets written before these existed leave them undefined; 1 = unchanged
     ac.set([a.nr === undefined ? 1 : a.nr, a.sharp === undefined ? 1 : a.sharp, 0, 0], i * 4);
-    fl.set([m.invert ? 1 : 0, m.opacity / 100, Math.max(0, m.brush), 0], i * 4);
+    const bits = (list) => {
+      let v = 0;
+      (list || []).forEach(id => {
+        const k = s.masks.findIndex(x => x.id === id);
+        if (k >= 0 && k < MAXM && k !== i) v |= (1 << k);
+      });
+      return v;
+    };
+    fl.set([m.invert ? 1 : 0, m.opacity / 100, Math.max(0, m.brush), bits(m.sub)], i * 4);
+    ac[i * 4 + 2] = m.helper ? 1 : 0;
+    ac[i * 4 + 3] = bits(m.inter);
   }
   gl.uniform1i(u.uMCount, n);
   gl.uniform1fv(u.uMType, ty); gl.uniform4fv(u.uMGeoA, ga); gl.uniform4fv(u.uMGeoB, gb);
@@ -1220,17 +1255,70 @@ function rebuildMasks() {
     list.append(d);
   });
   const m = ms[A.selMask]; if (!m) return;
+  const nameRow = document.createElement('div'); nameRow.className = 'field'; nameRow.style.margin = '2px 0 6px';
+  const nameIn = document.createElement('input'); nameIn.type = 'text'; nameIn.value = m.name;
+  nameIn.style.flex = '1'; nameIn.style.minWidth = '0';
+  nameIn.oninput = () => { m.name = nameIn.value; };
+  nameIn.onchange = () => rebuildMasks();
+  const dup = document.createElement('div'); dup.className = 'chip'; dup.textContent = 'Duplicate';
+  dup.title = 'Copy this mask so you can trim the copy to one part';
+  dup.onclick = () => duplicateMask(A.selMask);
+  nameRow.append(nameIn, dup);
+  host.append(nameRow);
+
   const opts = document.createElement('div'); opts.className = 'grp'; host.append(opts);
   const inv = document.createElement('div'); inv.className = 'chip' + (m.invert ? ' on' : ''); inv.textContent = 'Invert';
   inv.onclick = () => { m.invert = !m.invert; inv.classList.toggle('on', m.invert); requestRender(true); }; opts.append(inv);
+  const hlp = document.createElement('div'); hlp.className = 'chip' + (m.helper ? ' on' : '');
+  hlp.textContent = 'Helper only'; hlp.title = 'Shape other masks without applying its own adjustments';
+  hlp.onclick = () => { m.helper = !m.helper; hlp.classList.toggle('on', m.helper); requestRender(true); };
+  opts.append(hlp);
   const shw = document.createElement('div'); shw.className = 'chip' + (A.showMask ? ' on' : ''); shw.textContent = 'Show overlay';
   shw.onclick = () => { A.showMask = !A.showMask; shw.classList.toggle('on', A.showMask); requestRender(true); }; opts.append(shw);
   if (m.type === 'brush') {
+    ['Grow', 'Shrink', 'Soften'].forEach(label => {
+      const c = document.createElement('div'); c.className = 'chip'; c.textContent = label;
+      c.onclick = () => morphBrush(m.brush, label.toLowerCase() === 'soften' ? 'feather' : label.toLowerCase());
+      opts.append(c);
+    });
     const clr = document.createElement('div'); clr.className = 'chip'; clr.textContent = 'Clear paint';
     clr.onclick = () => { const bc = IM().brushes[m.brush]; bc.ctx.clearRect(0, 0, bc.canvas.width, bc.canvas.height); uploadBrush(m.brush); requestRender(true); };
     opts.append(clr);
   }
   sl(host, 'opacity', 'Mask opacity', 0, 100, 1, 100, 'int', () => m, 'mask');
+
+  // subtract or intersect the other masks — this is how a gradient goes behind a subject
+  if (ms.length > 1) {
+    host.insertAdjacentHTML('beforeend', '<div class="divline"></div><div class="hint">Combine with</div>');
+    const wrap = document.createElement('div'); wrap.className = 'mlist'; host.append(wrap);
+    ms.forEach((other, j) => {
+      if (other.id === m.id) return;
+      const row = document.createElement('div'); row.className = 'mitem';
+      const state = (m.sub || []).includes(other.id) ? 'sub'
+        : (m.inter || []).includes(other.id) ? 'inter' : 'off';
+      row.innerHTML = `<span class="nm"></span><span class="k" style="letter-spacing:0"></span>`;
+      row.querySelector('.nm').textContent = other.name;
+      const tag = row.querySelector('.k');
+      const label = { off: 'ignore', sub: 'subtract', inter: 'intersect' };
+      const paint = st => {
+        tag.textContent = label[st];
+        tag.style.color = st === 'off' ? 'var(--faint)' : 'var(--amber)';
+        row.classList.toggle('sel', st !== 'off');
+      };
+      paint(state);
+      row.onclick = () => {
+        m.sub = (m.sub || []).filter(x => x !== other.id);
+        m.inter = (m.inter || []).filter(x => x !== other.id);
+        const cur = tag.textContent;
+        const next = cur === 'ignore' ? 'sub' : cur === 'subtract' ? 'inter' : 'off';
+        if (next === 'sub') m.sub.push(other.id);
+        if (next === 'inter') m.inter.push(other.id);
+        paint(next);
+        requestRender(true);
+      };
+      wrap.append(row);
+    });
+  }
 
   host.insertAdjacentHTML('beforeend', '<div class="divline"></div>');
   if (m.type === 'radial') {
@@ -1267,6 +1355,67 @@ function rebuildMasks() {
   sl(host, 'sharp', 'Sharpen ×', 0, 2, .05, 1, 'f2', A_, 'mask');
   host.insertAdjacentHTML('beforeend', '<div class="hint">Denoise 0 leaves this region untouched by noise reduction; 2 doubles it. Put a mask on your subject at 0 and the sky stays smooth while he stays sharp.</div>');
   drawOverlay();
+}
+
+
+/* ---------------- carving a selection into parts ---------------- */
+function freeBrushSlot(masks) {
+  const used = new Set(masks.filter(m => m.type === 'brush' && m.brush >= 0).map(m => m.brush));
+  for (let i = 0; i < MAXBRUSH; i++) if (!used.has(i)) return i;
+  return -1;
+}
+
+/* copy a mask so it can be trimmed down to one part of the subject */
+function duplicateMask(i) {
+  const s = S(), src = s.masks[i];
+  if (!src) return;
+  if (s.masks.length >= MAXM) { toast('Six masks max'); return; }
+  const copy = JSON.parse(JSON.stringify(src));
+  copy.id = idc();
+  copy.name = src.name + ' copy';
+  copy.sub = []; copy.inter = [];
+  if (src.type === 'brush') {
+    const slot = freeBrushSlot(s.masks);
+    if (slot < 0) { toast('Four brush masks max — this one cannot be copied'); return; }
+    const from = ensureBrush(src.brush), to = ensureBrush(slot);
+    to.ctx.clearRect(0, 0, to.canvas.width, to.canvas.height);
+    to.ctx.drawImage(from.canvas, 0, 0, to.canvas.width, to.canvas.height);
+    copy.brush = slot;
+    uploadBrush(slot);
+  }
+  s.masks.splice(i + 1, 0, copy);
+  A.selMask = i + 1;
+  rebuildMasks(); requestRender(true);
+  toast('Duplicated — trim this copy to the part you want');
+}
+
+/* grow, shrink or soften a painted mask: blur once, then re-threshold */
+function morphBrush(idx, mode) {
+  const b = ensureBrush(idx);
+  if (!b) return;
+  const c = b.canvas, w = c.width, h = c.height;
+  const r = Math.max(2, Math.round(Math.max(w, h) * 0.012));
+  const tmp = document.createElement('canvas');
+  tmp.width = w; tmp.height = h;
+  const tc = tmp.getContext('2d');
+  tc.filter = `blur(${r}px)`;
+  tc.drawImage(c, 0, 0);
+  tc.filter = 'none';
+  const id = tc.getImageData(0, 0, w, h);
+  const d = id.data;
+  // put the 50% crossing at t: below t erodes away, above it fills in
+  const t = mode === 'grow' ? 0.25 : mode === 'shrink' ? 0.75 : -1;
+  for (let i = 0; i < d.length; i += 4) {
+    let a = d[i + 3] / 255;
+    if (t >= 0) a = Math.max(0, Math.min(1, (a - (t - 0.06)) / 0.12));
+    d[i] = d[i + 1] = d[i + 2] = 255;
+    d[i + 3] = Math.round(a * 255);
+  }
+  const cx = c.getContext('2d');
+  cx.clearRect(0, 0, w, h);
+  cx.putImageData(id, 0, 0);
+  uploadBrush(idx);
+  requestRender(true);
 }
 
 /* ---------------- brush surfaces ---------------- */

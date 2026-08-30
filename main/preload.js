@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('native', {
   chooseFolder: () => ipcRenderer.invoke('dialog:folder'),
   writeInto: (dir, name, bytes) => ipcRenderer.invoke('file:write', { dir, name, bytes }),
   reveal: (p) => ipcRenderer.invoke('shell:reveal', p),
+  readAsset: (rel) => ipcRenderer.invoke('asset:read', rel),
   storeGet: () => ipcRenderer.invoke('store:get'),
   storeSet: (obj) => ipcRenderer.invoke('store:set', obj),
   info: () => ipcRenderer.invoke('app:info'),

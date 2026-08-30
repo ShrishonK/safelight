@@ -410,9 +410,12 @@ function applyPreset(p) {
   const keep = {};
   GEOM_KEYS.forEach(k => keep[k] = im.s[k]);
   const brushes = (im.s.masks || []).filter(m => m.type === 'brush');   // your painting survives
-  const next = Object.assign(defaults(), JSON.parse(JSON.stringify(p.settings)), keep);
+  const incoming = JSON.parse(JSON.stringify(p.settings));
+  for (const k of Object.keys(incoming)) if (incoming[k] === null || incoming[k] === undefined) delete incoming[k];
+  const next = Object.assign(defaults(), incoming, keep);
   next.masks = (next.masks || []).filter(m => m.type !== 'brush').map(m => Object.assign(
-    { id: idc(), invert: false, opacity: 100, brush: -1, adj: defMaskAdj() }, m));
+    { id: idc(), invert: false, opacity: 100, brush: -1 }, m,
+    { adj: Object.assign(defMaskAdj(), m.adj) }));
   next.masks = next.masks.concat(brushes).slice(0, MAXM);
   im.s = next;
   A.selMask = next.masks.length ? 0 : -1;
@@ -545,6 +548,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       case 'export': exportDialog(false); break;
       case 'export-all': exportDialog(true); break;
       case 'convert-raw': convertRaw(); break;
+      case 'select-subject': selectSubject(); break;
       case 'save-sidecar': saveSidecar(); break;
       case 'save-preset': savePresetAs(true); break;
       case 'load-sidecar': loadSidecar(); break;
