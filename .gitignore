@@ -1,3 +1,25 @@
 node_modules/
 dist/
 .DS_Store
+
+# Ruflo local secrets and runtime data
+.env
+.env.local
+.env.*.local
+.claude-flow/data/
+.claude-flow/logs/
+.claude-flow/sessions/
+
+# Ruflo machine-specific configuration
+.claude/settings.local.json
+.mcp.json
+
+# Ruflo live state
+.claude-flow/daemon-state.json
+.claude-flow/daemon.pid
+.claude-flow/harness-active-policy.json
+.claude-flow/metrics/
+.claude-flow/policy/
+.claude-flow/security/
+.swarm/
+ruvector.db
