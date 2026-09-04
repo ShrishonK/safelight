@@ -126,6 +126,19 @@ function featherWeight(i, n, overlap) {
   return Math.max(w, 1e-4);
 }
 
+/* Some exports fix the spatial input size instead of leaving it dynamic (e.g. a
+   320x320-only graph); feeding such a model any other size fails outright at
+   OrtRun with a dimension mismatch. Read the declared shape back off the session
+   so tiling respects it instead of always assuming the configured tile fits. */
+function modelFixedSize(sess) {
+  try {
+    const shape = sess.inputMetadata && sess.inputMetadata[0] && sess.inputMetadata[0].shape;
+    if (!shape || shape.length !== 4) return null;
+    const h = shape[2], w = shape[3];
+    return (typeof h === 'number' && typeof w === 'number' && h > 0 && w > 0 && h === w) ? h : null;
+  } catch { return null; }
+}
+
 /* run the model over one RGBA byte image, returning denoised RGB floats 0..1 */
 async function runModel(rgba, W, H, onProgress) {
   const ort = AI.ort, sess = AI.session;
@@ -135,7 +148,8 @@ async function runModel(rgba, W, H, onProgress) {
   // Networks with several downsampling stages need sides that are a multiple of 64,
   // or they return a differently sized tensor and everything after this is garbage.
   const round64 = n => Math.max(64, Math.ceil(n / 64) * 64);
-  const T = Math.min(round64(AI.tile), round64(Math.max(W, H) + 2 * OV));
+  const fixed = modelFixedSize(sess);
+  const T = fixed || Math.min(round64(AI.tile), round64(Math.max(W, H) + 2 * OV));
   const step = Math.max(64, T - OV * 2);
 
   // Tiles overhang the frame by the overlap and sample replicated edge pixels.
