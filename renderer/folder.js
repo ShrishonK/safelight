@@ -9,10 +9,30 @@
    ============================================================ */
 'use strict';
 
-const FOLDER = { dir: null, name: '', parent: null, folders: [], files: [], cur: -1 };
+const FOLDER = { dir: null, name: '', parent: null, folders: [], files: [], cur: -1, selectMode: false, selected: new Set() };
 const EDITS = new Map();          // path -> settings, so nothing is lost on eviction
 const THUMBS = new Map();         // path -> object URL
 const KEEP_DECODED = 6;
+
+/* edits are also mirrored to disk (keyed by path) so a look survives quitting
+   the app entirely, not just switching photos within a session */
+let editsLoaded = window.native
+  ? N.editsGetAll().then(all => { for (const p in (all || {})) EDITS.set(p, all[p]); })
+  : Promise.resolve();
+const _persistTimers = new Map();
+function persistEditsNow(path, settings) {
+  if (!path || !window.native) return;
+  clearTimeout(_persistTimers.get(path));
+  _persistTimers.delete(path);
+  N.editsSet(path, settings);
+}
+function scheduleEditPersist(path, settings) {
+  if (!path) return;
+  EDITS.set(path, JSON.parse(JSON.stringify(settings)));
+  if (!window.native) return;
+  clearTimeout(_persistTimers.get(path));
+  _persistTimers.set(path, setTimeout(() => { _persistTimers.delete(path); N.editsSet(path, EDITS.get(path)); }, 800));
+}
 
 const isRawPath = n => RAWRE.test(n);
 
@@ -23,15 +43,18 @@ async function openFolder(dir) {
   if (!r || r.error) { toast(r ? r.error : 'Could not read that folder'); return; }
   FOLDER.dir = r.dir; FOLDER.name = r.name; FOLDER.parent = r.parent;
   FOLDER.folders = r.folders; FOLDER.files = r.files; FOLDER.cur = -1;
+  exitSelectMode();
   document.getElementById('crumb').textContent = r.dir;
   document.getElementById('crumb').title = r.dir;
   N.storeSet({ lastFolder: r.dir });
   renderFolder();
   toast(`${r.files.length} photo${r.files.length === 1 ? '' : 's'} in ${r.name}`);
+  idlePrefetch();
 }
 
 function closeFolder() {
   FOLDER.dir = null; FOLDER.folders = []; FOLDER.files = []; FOLDER.cur = -1;
+  exitSelectMode();
   for (const url of THUMBS.values()) URL.revokeObjectURL(url);
   THUMBS.clear();
   document.getElementById('crumb').textContent = 'no folder open';
@@ -87,7 +110,8 @@ function openThumb(im, i) {
 
 function fileThumb(f, i) {
   const d = document.createElement('div');
-  d.className = 'thumb' + (i === FOLDER.cur ? ' sel' : '') + (THUMBS.has(f.path) ? '' : ' loading');
+  const picked = FOLDER.selected.has(f.path);
+  d.className = 'thumb' + (i === FOLDER.cur ? ' sel' : '') + (THUMBS.has(f.path) ? '' : ' loading') + (picked ? ' picked' : '');
   d.dataset.path = f.path; d.dataset.index = i;
   const img = document.createElement('img');
   if (THUMBS.has(f.path)) img.src = THUMBS.get(f.path);
@@ -95,8 +119,84 @@ function fileThumb(f, i) {
   d.append(img, cap);
   if (EDITS.has(f.path)) { const e = document.createElement('div'); e.className = 'edited'; d.append(e); }
   if (A.imgs.some(im => im.path === f.path)) { const o = document.createElement('div'); o.className = 'open'; d.append(o); }
-  d.onclick = () => openPhotoAt(i);
+  if (FOLDER.selectMode) { const s = document.createElement('div'); s.className = 'sel-badge'; d.append(s); }
+  d.onclick = () => FOLDER.selectMode ? toggleSelect(f.path) : openPhotoAt(i);
+  d.oncontextmenu = e => { e.preventDefault(); showThumbMenu(e, f); };
   return d;
+}
+
+/* ---------- multi-select, for exporting only a chosen few ---------- */
+function syncSelbar() {
+  const bar = document.getElementById('selbar');
+  bar.hidden = !FOLDER.selectMode;
+  if (FOLDER.selectMode) {
+    document.getElementById('selCount').textContent =
+      `${FOLDER.selected.size} selected`;
+  }
+}
+function enterSelectMode(startPath) {
+  FOLDER.selectMode = true;
+  if (startPath) FOLDER.selected.add(startPath);
+  syncSelbar();
+  renderFolder();
+}
+function exitSelectMode() {
+  if (!FOLDER.selectMode && !FOLDER.selected.size) return;
+  FOLDER.selectMode = false;
+  FOLDER.selected.clear();
+  syncSelbar();
+  renderFolder();
+}
+function toggleSelect(path) {
+  if (FOLDER.selected.has(path)) FOLDER.selected.delete(path); else FOLDER.selected.add(path);
+  syncSelbar();
+  renderFolder();
+}
+function selectAllInFolder() {
+  FOLDER.files.forEach(f => FOLDER.selected.add(f.path));
+  syncSelbar();
+  renderFolder();
+}
+function clearSelection() {
+  FOLDER.selected.clear();
+  syncSelbar();
+  renderFolder();
+}
+
+/* a small floating menu at the cursor, not the centred #modal dialog */
+function closeThumbMenu() {
+  const m = document.getElementById('ctxMenu');
+  m.classList.remove('open'); m.innerHTML = '';
+}
+function menuRow(label, onClick) {
+  const d = document.createElement('div'); d.className = 'frow'; d.textContent = label;
+  d.onclick = () => { closeThumbMenu(); onClick(); };
+  return d;
+}
+function menuSep() { const d = document.createElement('div'); d.className = 'sep'; return d; }
+function showThumbMenu(e, f) {
+  const m = document.getElementById('ctxMenu');
+  m.innerHTML = '';
+  if (!FOLDER.selectMode) {
+    m.append(menuRow('Select images…', () => enterSelectMode(f.path)));
+  } else {
+    const picked = FOLDER.selected.has(f.path);
+    m.append(menuRow(picked ? 'Deselect this photo' : 'Select this photo', () => toggleSelect(f.path)));
+    m.append(menuRow('Select all in folder', selectAllInFolder));
+    m.append(menuRow('Clear selection', clearSelection));
+    m.append(menuSep());
+    m.append(menuRow(`Export ${FOLDER.selected.size} selected…`, () => {
+      if (!FOLDER.selected.size) { toast('Nothing selected'); return; }
+      exportDialog('selected');
+    }));
+    m.append(menuSep());
+    m.append(menuRow('Done selecting', exitSelectMode));
+  }
+  const pad = 6, vw = innerWidth, vh = innerHeight;
+  m.classList.add('open');
+  const r = m.getBoundingClientRect();
+  m.style.left = Math.min(e.clientX, vw - r.width - pad) + 'px';
+  m.style.top = Math.min(e.clientY, vh - r.height - pad) + 'px';
 }
 
 /* thumbnails are generated only as they scroll into view */
@@ -165,10 +265,33 @@ async function ppmToBlob(bytes) {
   return new Promise(r => c.toBlob(r, 'image/jpeg', .8));
 }
 
+/* once a photo is edited, its strip thumbnail should show that edit rather
+   than the untouched embedded preview it started from */
+const _thumbTimers = new Map();
+function scheduleThumbRefresh(im) {
+  if (!im || !im.path || typeof renderThumb !== 'function') return;
+  clearTimeout(_thumbTimers.get(im.path));
+  _thumbTimers.set(im.path, setTimeout(async () => {
+    _thumbTimers.delete(im.path);
+    try {
+      const blob = await renderThumb(im);
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const old = THUMBS.get(im.path);
+      THUMBS.set(im.path, url);
+      im.thumb = url;
+      if (old) URL.revokeObjectURL(old);
+      renderFolder();
+    } catch (e) { console.warn('thumb refresh failed', im.path, e && e.message); }
+  }, 500));
+}
+
 /* ---------- loading a photo, with a bounded cache ---------- */
 function rememberEdits() {
   const im = IM();
-  if (im && im.path) EDITS.set(im.path, JSON.parse(JSON.stringify(im.s)));
+  if (!im || !im.path) return;
+  EDITS.set(im.path, JSON.parse(JSON.stringify(im.s)));
+  persistEditsNow(im.path, im.s);
 }
 
 function evictOld() {
@@ -180,7 +303,7 @@ function evictOld() {
     }
     if (victim < 0) break;
     const im = A.imgs[victim];
-    if (im.path) EDITS.set(im.path, JSON.parse(JSON.stringify(im.s)));
+    if (im.path) { EDITS.set(im.path, JSON.parse(JSON.stringify(im.s))); persistEditsNow(im.path, im.s); }
     if (im.tex) gl.deleteTexture(im.tex);
     (im.brushes || []).forEach(b => { if (b) { b.canvas.width = b.canvas.height = 1; } });
     A.imgs.splice(victim, 1);
@@ -190,6 +313,7 @@ function evictOld() {
 
 async function openPhotoAt(i) {
   if (i < 0 || i >= FOLDER.files.length) return;
+  await editsLoaded;
   const f = FOLDER.files[i];
   rememberEdits();
   FOLDER.cur = i;
@@ -208,18 +332,62 @@ async function openPhotoAt(i) {
     const before = A.imgs.length;
     await loadFromNative([file]);
     if (A.imgs.length === before) return;              // loadFiles already reported why
-    const im = A.imgs[A.imgs.length - 1];
+    let im = A.imgs[A.imgs.length - 1];
+    // background prefetch may have finished this exact photo while we were decoding it too
+    const dupe = A.imgs.slice(0, -1).findIndex(x => x.path === f.path);
+    if (dupe >= 0) {
+      if (im.tex) gl.deleteTexture(im.tex);
+      A.imgs.pop();
+      im = A.imgs[dupe];
+    }
     im.path = f.path;
     im.lastUsed = Date.now();
     if (EDITS.has(f.path)) { im.s = JSON.parse(JSON.stringify(EDITS.get(f.path))); im.dirty = true; }
-    A.cur = A.imgs.length - 1;
+    A.cur = A.imgs.indexOf(im);
     evictOld();
-    selectImage(A.imgs.findIndex(x => x.path === f.path));
+    selectImage(A.imgs.indexOf(im));
   } catch (e) {
     toast(f.name + ': ' + e.message);
   } finally {
     busy(null);
     renderFolder();
+    idlePrefetch();
+  }
+}
+
+/* ---------- background pre-decode ----------
+   Raws are slow to demosaic; decode the neighbours of whatever is open
+   during idle time so stepping to them is instant instead of another wait. */
+let prefetching = false;
+const _ric = window.requestIdleCallback || (fn => setTimeout(() => fn({ timeRemaining: () => 0 }), 300));
+function idlePrefetch() { _ric(() => prefetchNext()); }
+
+async function prefetchNext() {
+  if (prefetching || !FOLDER.dir) return;
+  const order = [FOLDER.cur + 1, FOLDER.cur - 1, FOLDER.cur + 2];
+  const i = order.find(i => i >= 0 && i < FOLDER.files.length &&
+    isRawPath(FOLDER.files[i].name) && !A.imgs.some(im => im.path === FOLDER.files[i].path));
+  if (i === undefined) return;
+  const f = FOLDER.files[i];
+  prefetching = true;
+  try {
+    await editsLoaded;
+    const [raw] = await N.readFiles([f.path]);
+    if (!raw) return;
+    const file = new File([new Uint8Array(raw.bytes)], raw.name);
+    const im = await decodeRawToImage(file, true);
+    if (A.imgs.some(x => x.path === f.path)) return;   // the user opened it while we were decoding
+    im.path = f.path;
+    im.lastUsed = Date.now();
+    if (EDITS.has(f.path)) { im.s = JSON.parse(JSON.stringify(EDITS.get(f.path))); im.dirty = true; }
+    A.imgs.push(im);
+    evictOld();
+    renderFolder();
+  } catch (e) {
+    console.warn('prefetch failed', f.path, e && e.message);
+  } finally {
+    prefetching = false;
+    idlePrefetch();          // keep working through the neighbours, one at a time
   }
 }
 
@@ -261,10 +429,27 @@ document.addEventListener('DOMContentLoaded', () => {
   addEventListener('keydown', e => {
     const t = e.target;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+    if (e.key === 'Escape' && FOLDER.selectMode) { exitSelectMode(); return; }
     if (e.metaKey || e.ctrlKey || !FOLDER.dir) return;
     if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { if (stepPhoto(1)) e.stopImmediatePropagation(); }
     if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { if (stepPhoto(-1)) e.stopImmediatePropagation(); }
   }, true);
+
+  document.getElementById('selAll').onclick = selectAllInFolder;
+  document.getElementById('selNone').onclick = clearSelection;
+  document.getElementById('selDone').onclick = exitSelectMode;
+  document.getElementById('selExport').onclick = () => {
+    if (!FOLDER.selected.size) { toast('Nothing selected'); return; }
+    exportDialog('selected');
+  };
+
+  // close the right-click menu on any outside interaction
+  addEventListener('pointerdown', e => {
+    const m = document.getElementById('ctxMenu');
+    if (m.classList.contains('open') && !m.contains(e.target)) closeThumbMenu();
+  }, true);
+  addEventListener('blur', closeThumbMenu, true);
+  addEventListener('scroll', closeThumbMenu, true);
 
   const prevBuild = window.buildStrip;
   window.buildStrip = function () { renderFolder(); };

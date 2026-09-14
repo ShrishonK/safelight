@@ -81,6 +81,7 @@ function buildMenu() {
       { type: 'separator' },
       { label: 'Export photo…', accelerator: 'CmdOrCtrl+E', click: menuSend('export') },
       { label: 'Export all photos…', accelerator: 'CmdOrCtrl+Shift+E', click: menuSend('export-all') },
+      { label: 'Export selected photos…', click: menuSend('export-selected') },
       { type: 'separator' },
       { label: 'Convert raw to .fedr…', click: menuSend('convert-raw') },
       { type: 'separator' },
@@ -229,6 +230,16 @@ ipcMain.handle('asset:read', (_e, rel) => {
 
 ipcMain.handle('store:get', () => readStore());
 ipcMain.handle('store:set', (_e, obj) => { writeStore(Object.assign(readStore(), obj)); return true; });
+
+/* per-photo edits, keyed by absolute path, so a look survives closing the app */
+ipcMain.handle('edits:getAll', () => readStore().edits || {});
+ipcMain.handle('edits:set', (_e, { path, settings }) => {
+  const st = readStore();
+  st.edits = st.edits || {};
+  if (settings) st.edits[path] = settings; else delete st.edits[path];
+  writeStore(st);
+  return true;
+});
 ipcMain.handle('app:info', () => ({ version: app.getVersion(), platform: process.platform, electron: process.versions.electron }));
 ipcMain.handle('shell:reveal', (_e, p) => { shell.showItemInFolder(p); });
 

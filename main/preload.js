@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld('native', {
   readAsset: (rel) => ipcRenderer.invoke('asset:read', rel),
   storeGet: () => ipcRenderer.invoke('store:get'),
   storeSet: (obj) => ipcRenderer.invoke('store:set', obj),
+  editsGetAll: () => ipcRenderer.invoke('edits:getAll'),
+  editsSet: (path, settings) => ipcRenderer.invoke('edits:set', { path, settings }),
   info: () => ipcRenderer.invoke('app:info'),
   onMenu: (cb) => ipcRenderer.on('menu', (_e, cmd) => cb(cmd)),
   onOpenFiles: (cb) => ipcRenderer.on('open-files', (_e, files) => cb(files)),

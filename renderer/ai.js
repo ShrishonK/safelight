@@ -21,6 +21,9 @@ const AI = {
 /* the model is large, so it lives in IndexedDB after the first fetch */
 const MODEL_DB = 'safelight-models';
 
+/* bundled so denoising works with nothing installed, the same way the subject model does */
+const BUILTIN_DENOISE = 'scunet_color_real_psnr.onnx';
+
 function idb() {
   return new Promise((res, rej) => {
     const r = indexedDB.open(MODEL_DB, 1);
@@ -97,6 +100,19 @@ async function loadModel(key, rec, onProgress) {
   AI.modelName = key;
   AI.backend = gpu ? 'webgpu' : 'wasm';
   return AI.session;
+}
+
+/* load the model shipped with the app — it is already on disk, so unlike
+   installModelFiles this never touches IndexedDB */
+async function loadBuiltinDenoise() {
+  const onnx = await window.native.readAsset('vendor/models/scunet_color_real_psnr.onnx');
+  const data = await window.native.readAsset('vendor/models/scunet_color_real_psnr.onnx.data');
+  if (!onnx || !data) throw new Error('the bundled denoise model is missing from this build');
+  const rec = {
+    main: new Uint8Array(onnx.bytes),
+    ext: [{ path: 'scunet_color_real_psnr.onnx.data', data: new Uint8Array(data.bytes) }]
+  };
+  return loadModel(BUILTIN_DENOISE, rec);
 }
 
 /* ---------- pixel plumbing ----------
@@ -197,7 +213,11 @@ async function runModel(rgba, W, H, onProgress) {
 async function aiDenoise(opts) {
   const im = IM();
   if (!im) { toast('Open a photo first'); return; }
-  if (!AI.session) { aiModelDialog(); return; }
+  if (!AI.session) {
+    try { await busy('Loading the denoise model'); await loadBuiltinDenoise(); }
+    catch (e) { busy(null); aiModelDialog(); return; }
+    busy(null);
+  }
   opts = Object.assign({ strength: 1 }, opts);
   AI.cancel = false;
 
@@ -291,12 +311,14 @@ async function aiModelDialog() {
   document.getElementById('card').innerHTML = `
     <h4>Neural denoise model</h4>
     <div class="cbody">
-      <div class="hint">Safelight ships the runtime but not a model — they are 60–130 MB and licensed
-      separately. Install the <b>.onnx</b> file, and if the download also came with an
-      <b>.onnx.data</b> file, select both together. Cached afterwards, so this is a one-off.</div>
-      <div class="field"><span>Installed</span><select id="aiPick">${installed.length
-      ? installed.map(k => `<option>${k}</option>`).join('')
-      : '<option value="">none yet</option>'}</select></div>
+      <div class="hint">SCUNet colour denoise is built in and used by default. Other .onnx models
+      (60–130 MB, licensed separately) can be added below — select the <b>.onnx</b> file, and if
+      the download also came with an <b>.onnx.data</b> file, select both together. Cached
+      afterwards, so this is a one-off.</div>
+      <div class="field"><span>Installed</span><select id="aiPick">
+        <option value="${BUILTIN_DENOISE}">${BUILTIN_DENOISE} (built in)</option>
+        ${installed.map(k => `<option>${k}</option>`).join('')}
+      </select></div>
       <div class="field"><span>Add a model</span><button class="tb" id="aiAdd">Choose files…</button></div>
       <div class="field"><span>Strength</span><input type="number" id="aiStr" min="10" max="100" step="5" value="100"></div>
       <div class="hint">Suggested: SCUNet colour real, or NAFNet SIDD. You can also drag the model
@@ -304,7 +326,7 @@ async function aiModelDialog() {
     </div>
     <div class="foot">
       <button class="tb" id="aiCancel">Close</button>
-      <button class="tb primary" id="aiRun"${installed.length ? '' : ' disabled'}>Denoise</button>
+      <button class="tb primary" id="aiRun">Denoise</button>
     </div>`;
   document.getElementById('modal').classList.add('open');
   document.getElementById('aiCancel').onclick = () => document.getElementById('modal').classList.remove('open');
@@ -325,7 +347,11 @@ async function aiModelDialog() {
     const strength = (parseInt(document.getElementById('aiStr').value) || 100) / 100;
     document.getElementById('modal').classList.remove('open');
     try {
-      if (!AI.session || AI.modelName !== key) { await busy('Loading ' + key); await loadModel(key, null, m => busy(m)); }
+      if (!AI.session || AI.modelName !== key) {
+        await busy('Loading ' + key);
+        if (key === BUILTIN_DENOISE) await loadBuiltinDenoise();
+        else await loadModel(key, null, m => busy(m));
+      }
     } catch (e) { busy(null); showError('Could not load the model', [String(e.message)]); return; }
     aiDenoise({ strength });
   };
