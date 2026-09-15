@@ -11,8 +11,13 @@
 const SEG = { session: null, size: 320 };
 const SEG_MODEL = 'vendor/models/u2netp.onnx';
 
-async function segSession() {
-  if (SEG.session) return SEG.session;
+/* forceCpu re-creates the session on the wasm backend only, bypassing WebGPU.
+   Pass it after a run() failure: some ops this network uses (MaxPool with
+   ceil-mode rounding) aren't implemented by the WebGPU kernel yet, and that
+   surfaces as a failure from OrtRun itself rather than at session creation,
+   so it can't be caught by a try/catch around InferenceSession.create alone. */
+async function segSession(forceCpu) {
+  if (SEG.session && (!forceCpu || SEG.backend === 'wasm')) return SEG.session;
   const ort = await ensureOrt();
   let bytes = await modelGet('__subject__');
   if (!bytes) {
@@ -22,12 +27,28 @@ async function segSession() {
     try { await modelPut('__subject__', bytes); } catch (e) { /* cache is optional */ }
   }
   if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes.main || bytes);
-  const gpu = await haveWebGPU();
+  const gpu = !forceCpu && await haveWebGPU();
   SEG.session = await ort.InferenceSession.create(bytes, {
     executionProviders: gpu ? ['webgpu', 'wasm'] : ['wasm'],
     graphOptimizationLevel: 'all'
   });
+  SEG.backend = gpu ? 'webgpu' : 'wasm';
   return SEG.session;
+}
+
+/* run segmentation, retrying once on the CPU backend if the GPU backend
+   rejects the graph at execution time (see segSession above) */
+async function runSeg(input, N_) {
+  const ort = AI.ort;
+  let sess = await segSession();
+  const tensor = new ort.Tensor('float32', input, [1, 3, N_, N_]);
+  try {
+    return { sess, res: await sess.run({ [sess.inputNames[0]]: tensor }) };
+  } catch (e) {
+    if (SEG.backend === 'wasm') throw e;
+    sess = await segSession(true);
+    return { sess, res: await sess.run({ [sess.inputNames[0]]: tensor }) };
+  }
 }
 
 /* the network is trained on ordinary daylight pictures, so it sees a
@@ -74,8 +95,7 @@ async function selectSubject() {
 
   try {
     await busy('Looking for the subject');
-    const sess = await segSession();
-    const ort = AI.ort;
+    await segSession();   // load (and fail fast on) the model before rendering the proxy
 
     // a small proxy is plenty: the network only ever sees 320px
     const G = geom(s, im.w, im.h);
@@ -94,7 +114,7 @@ async function selectSubject() {
 
     const N_ = SEG.size;
     const input = segInput(rgba, pw, ph, N_);
-    const res = await sess.run({ [sess.inputNames[0]]: new ort.Tensor('float32', input, [1, 3, N_, N_]) });
+    const { sess, res } = await runSeg(input, N_);
     const map = res[sess.outputNames[0]].data;
 
     let lo = Infinity, hi = -Infinity;
