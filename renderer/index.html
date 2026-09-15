@@ -170,11 +170,33 @@
       background: var(--panel);
       border-right: 1px solid var(--line);
       display: grid;
-      grid-template-rows: auto auto 1fr;
+      grid-template-rows: auto auto auto 1fr;
       grid-template-columns: minmax(0, 1fr);
       min-height: 0;
       min-width: 0;
       overflow: hidden
+    }
+
+    #selbar {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 6px;
+      border-bottom: 1px solid var(--line);
+      background: #241c0c
+    }
+
+    #selbar[hidden] {
+      display: none
+    }
+
+    #selbar .tb {
+      padding: 4px 7px;
+      font-size: 11px
+    }
+
+    #selCount {
+      color: var(--amber)
     }
 
     #fbar {
@@ -327,6 +349,70 @@
       height: 5px;
       border-radius: 50%;
       background: var(--amber)
+    }
+
+    .thumb .sel-badge {
+      position: absolute;
+      bottom: 4px;
+      right: 4px;
+      width: 15px;
+      height: 15px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(255, 255, 255, .75);
+      background: rgba(10, 14, 18, .55);
+      box-shadow: 0 0 0 1px rgba(0, 0, 0, .5);
+    }
+
+    .thumb.picked .sel-badge {
+      background: var(--amber);
+      border-color: var(--amber);
+    }
+
+    .thumb.picked .sel-badge::after {
+      content: "";
+      position: absolute;
+      left: 4px;
+      top: 1px;
+      width: 4px;
+      height: 8px;
+      border: solid #1a1206;
+      border-width: 0 2px 2px 0;
+      transform: rotate(40deg)
+    }
+
+    .thumb.picked {
+      outline: 2px solid var(--amber);
+      outline-offset: -2px
+    }
+
+    /* ---------- thumbnail context menu ---------- */
+    #ctxMenu {
+      position: fixed;
+      z-index: 60;
+      min-width: 168px;
+      background: var(--panel);
+      border: 1px solid var(--line-hi);
+      border-radius: 5px;
+      box-shadow: 0 12px 34px rgba(0, 0, 0, .55);
+      padding: 4px;
+      display: none
+    }
+
+    #ctxMenu.open {
+      display: block
+    }
+
+    #ctxMenu .frow {
+      border-radius: 4px;
+      padding: 6px 9px;
+      font-size: 12px
+    }
+
+    #ctxMenu .sep {
+      height: 1px;
+      width: auto;
+      background: var(--line);
+      margin: 4px 2px
     }
 
     .thumb .n {
@@ -915,6 +1001,14 @@
         <button class="tb" id="btnUp" title="Go up a folder">↑</button>
         <div id="crumb">no folder open</div>
       </div>
+      <div id="selbar" hidden>
+        <span id="selCount" class="stat"></span>
+        <span class="spacer"></span>
+        <button class="tb" id="selAll">All</button>
+        <button class="tb" id="selNone">None</button>
+        <button class="tb primary" id="selExport">Export…</button>
+        <button class="tb" id="selDone">Done</button>
+      </div>
       <div id="tree"></div>
       <div id="strip">
         <div class="striphint">Drop a folder here<br>or click Folder…</div>
@@ -942,6 +1036,7 @@
   <div id="modal">
     <div class="card" id="card"></div>
   </div>
+  <div id="ctxMenu"></div>
   <div id="busy">
     <div class="bwrap">
       <div class="bspin"></div>

@@ -1525,6 +1525,10 @@ function renderNow(commit) {
     drawHisto(); drawCurve(); syncCurveBadge();
     pushHistory();
     buildStrip();
+    // cache the edit to disk (debounced) so it's never lost by navigating away or quitting
+    if (im.path && typeof scheduleEditPersist === 'function') scheduleEditPersist(im.path, im.s);
+    // and refresh the folder thumbnail so it shows the edit, not the untouched original
+    if (typeof scheduleThumbRefresh === 'function') scheduleThumbRefresh(im);
   }
 }
 
@@ -1875,6 +1879,38 @@ function freeExport() {
   ['ebase', 'eb1', 'eb2', 'eb3', 'eb4', 'eout'].forEach(k => {
     const f = FBO[k]; if (f) { gl.deleteTexture(f.tex); gl.deleteFramebuffer(f.fb); delete FBO[k]; }
   });
+}
+
+/* a small preview of the *developed* photo — used by the folder strip so a
+   thumbnail actually shows the edit, not just the untouched embedded preview.
+   Temporarily points the shared LUT/brush textures at `im` and restores
+   whichever photo was open, so this can run for any photo at any time
+   without disturbing what's on screen. */
+async function renderThumb(im, longEdge) {
+  const idx = A.imgs.indexOf(im);
+  if (idx < 0) return null;          // evicted before we got to it; skip rather than render with the wrong LUT
+  const keep = A.cur;
+  A.cur = idx;
+  try {
+    uploadAllBrushes(); uploadLUT();
+    const G = geom(im.s, im.w, im.h);
+    const k = (longEdge || 220) / Math.max(G.outW, G.outH);
+    const W = Math.max(1, Math.round(G.outW * k)), H = Math.max(1, Math.round(G.outH * k));
+    const R = develop(im, W, H, [1, 1], [.5, .5], true);
+    const px = new Uint8Array(W * H * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, R.out.fb);
+    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+    const ctx = cv.getContext('2d'), id = ctx.createImageData(W, H);
+    id.data.set(new Uint8ClampedArray(px.buffer, px.byteOffset, px.length));
+    for (let i = 3; i < id.data.length; i += 4) id.data[i] = 255;
+    ctx.putImageData(id, 0, 0);
+    freeExport();
+    return new Promise(res => cv.toBlob(res, 'image/jpeg', .75));
+  } finally {
+    A.cur = keep;
+    if (A.cur >= 0) { uploadAllBrushes(); uploadLUT(); }
+  }
 }
 
 async function renderFull(im, opts) {

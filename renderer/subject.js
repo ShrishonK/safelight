@@ -22,11 +22,16 @@ async function segSession() {
     try { await modelPut('__subject__', bytes); } catch (e) { /* cache is optional */ }
   }
   if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes.main || bytes);
-  const gpu = await haveWebGPU();
-  SEG.session = await ort.InferenceSession.create(bytes, {
-    executionProviders: gpu ? ['webgpu', 'wasm'] : ['wasm'],
-    graphOptimizationLevel: 'all'
-  });
+  // WebGPU can't compile this model's ceil_mode MaxPool ("using ceil() in shape
+  // computation is not yet supported"); WASM is plenty fast at 320px anyway.
+  try {
+    SEG.session = await ort.InferenceSession.create(bytes, {
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: 'all'
+    });
+  } catch (e) {
+    SEG.session = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'] });
+  }
   return SEG.session;
 }
 

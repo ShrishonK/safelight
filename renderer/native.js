@@ -128,6 +128,22 @@ function showError(title, lines) {
   document.getElementById('erOk').onclick = () => document.getElementById('modal').classList.remove('open');
 }
 
+/* decode a raw file straight to an editor image, without the file-open side effects
+   (busy overlay, toasts) so it can also run quietly as a background prefetch */
+async function decodeRawToImage(f, quiet) {
+  const bytes = new Uint8Array(await f.arrayBuffer());
+  let r;
+  try {
+    r = await decodeRaw(f.name, bytes, false);
+  } catch (e1) {
+    console.warn('full-size decode failed, retrying half size:', e1);
+    if (!quiet) await busy('Retrying ' + f.name + ' at half size');
+    r = await decodeRaw(f.name, bytes, true);
+    if (!quiet) toast(f.name + ' opened at half size');
+  }
+  return imageFromLinear(f.name, r.w, r.h, r.rgba, r.meta);
+}
+
 /* build an editor image straight from linear half-float pixels */
 function imageFromLinear(name, w, h, rgba, meta) {
   const im = baseImage(name, w, h, true);
@@ -169,17 +185,7 @@ window.loadFiles = async function (files) {
       }
       if (RAWRE.test(f.name)) {
         await busy('Developing ' + f.name + ' — the first open of a raw takes a moment');
-        const bytes = new Uint8Array(await f.arrayBuffer());
-        let r;
-        try {
-          r = await decodeRaw(f.name, bytes, false);
-        } catch (e1) {
-          console.warn('full-size decode failed, retrying half size:', e1);
-          await busy('Retrying ' + f.name + ' at half size');
-          r = await decodeRaw(f.name, bytes, true);
-          toast(f.name + ' opened at half size');
-        }
-        A.imgs.push(imageFromLinear(f.name, r.w, r.h, r.rgba, r.meta));
+        A.imgs.push(await decodeRawToImage(f, false));
       } else {
         await _loadFiles([f]);
         if (A.imgs.length === before) throw new Error('the image decoder rejected this file');
@@ -210,16 +216,43 @@ async function loadFromNative(picked) {
   });
   await loadFiles(files);
   // keep the source path so exports can default beside the original
-  A.imgs.forEach((im, i) => { const m = picked.find(p => p.name === im.name || p.name.replace(/\.[^.]+$/, '') === im.name); if (m && !im.path) im.path = m.path; });
+  A.imgs.forEach((im, i) => {
+    const m = picked.find(p => p.name === im.name || p.name.replace(/\.[^.]+$/, '') === im.name);
+    if (m && !im.path) im.path = m.path;
+    // a photo opened before, anywhere, picks its edits back up rather than starting blank
+    if (im.path && typeof EDITS !== 'undefined' && EDITS.has(im.path) && !im.dirty) {
+      im.s = JSON.parse(JSON.stringify(EDITS.get(im.path)));
+      im.dirty = true;
+    }
+  });
 }
 
-/* ---------- export, through real save dialogs ---------- */
-window.exportDialog = function (all) {
-  if (A.cur < 0) { toast('Open a photo first'); return; }
+/* ---------- export, through real save dialogs ----------
+   "current" exports the open photo. "all" and "selected" walk the whole
+   folder's file list (not just the handful currently decoded in memory),
+   decoding anything not already open on demand and freeing it right after
+   so a big batch never balloons memory. */
+function exportTargets(scope) {
+  if (typeof FOLDER !== 'undefined' && FOLDER.dir && FOLDER.files.length) {
+    if (scope === 'selected') return FOLDER.files.filter(f => FOLDER.selected && FOLDER.selected.has(f.path));
+    if (scope === 'all') return FOLDER.files.slice();
+    const f = FOLDER.files[FOLDER.cur];
+    return f ? [f] : (A.cur >= 0 ? [{ path: A.imgs[A.cur].path, name: A.imgs[A.cur].name }] : []);
+  }
+  // no folder open: fall back to whatever is loaded directly
+  if (scope === 'selected') { toast('Open a folder to select photos'); return []; }
+  const imgs = scope === 'all' ? A.imgs : (A.cur >= 0 ? [A.imgs[A.cur]] : []);
+  return imgs.map(im => ({ path: im.path, name: im.name }));
+}
+
+window.exportDialog = function (scopeArg) {
+  const scope = scopeArg === true ? 'all' : scopeArg === false ? 'current' : scopeArg;
+  if (A.cur < 0 && scope === 'current') { toast('Open a photo first'); return; }
+  const targets = exportTargets(scope);
+  if (!targets.length) { toast(scope === 'selected' ? 'Nothing selected' : 'Open a photo first'); return; }
   const card = document.getElementById('card');
-  const n = A.imgs.length;
   card.innerHTML = `
-    <h4>Export ${all ? n + ' photos' : 'photo'}</h4>
+    <h4>Export ${scope === 'current' ? 'photo' : targets.length + ' photos'}</h4>
     <div class="cbody">
       <div class="field"><span>Format</span><select id="exFmt">
         <option value="jpeg">JPEG</option><option value="png">PNG (lossless)</option><option value="webp">WebP</option>
@@ -231,14 +264,16 @@ window.exportDialog = function (all) {
     </div>
     <div class="foot">
       <button class="tb" id="exCancel">Cancel</button>
-      <button class="tb primary" id="exGo">${all ? 'Choose folder…' : 'Save as…'}</button>
+      <button class="tb primary" id="exGo">${scope === 'current' ? 'Save as…' : 'Choose folder…'}</button>
     </div>`;
   document.getElementById('exFmt').value = EXPORT.format;
   document.getElementById('exQ').value = EXPORT.quality;
   document.getElementById('exL').value = EXPORT.longEdge || '';
   document.getElementById('exS').value = EXPORT.suffix;
-  const im = IM(), G = geom(im.s, im.w, im.h);
-  document.getElementById('exInfo').textContent = `Full size ${Math.round(G.outW)} × ${Math.round(G.outH)} px`;
+  const im0 = A.cur >= 0 ? A.imgs[A.cur] : null;
+  document.getElementById('exInfo').textContent = im0
+    ? (() => { const G = geom(im0.s, im0.w, im0.h); return `Full size ${Math.round(G.outW)} × ${Math.round(G.outH)} px`; })()
+    : `${targets.length} photo${targets.length === 1 ? '' : 's'}`;
   document.getElementById('modal').classList.add('open');
   document.getElementById('exCancel').onclick = () => document.getElementById('modal').classList.remove('open');
   document.getElementById('exGo').onclick = async () => {
@@ -250,26 +285,56 @@ window.exportDialog = function (all) {
     document.getElementById('modal').classList.remove('open');
 
     const ext = EXPORT.format === 'jpeg' ? 'jpg' : EXPORT.format;
-    const targets = all ? A.imgs.map((_, i) => i) : [A.cur];
     let dir = null;
-    if (all) { dir = await N.chooseFolder(); if (!dir) return; }
-    const keep = A.cur;
-    let last = null;
-    for (const i of targets) {
-      const image = A.imgs[i];
-      const outName = image.name.replace(/\.[^.]+$/, '') + EXPORT.suffix + '.' + ext;
-      await busy(`Exporting ${targets.indexOf(i) + 1} of ${targets.length} — ${image.name}`);
-      A.cur = i; uploadAllBrushes(); uploadLUT();
+    if (scope !== 'current') { dir = await N.chooseFolder(); if (!dir) return; }
+    const keepIm = A.cur >= 0 ? A.imgs[A.cur] : null;
+    let last = null, ok = 0;
+    for (let n = 0; n < targets.length; n++) {
+      const f = targets[n];
+      await busy(`Exporting ${n + 1} of ${targets.length} — ${f.name}`);
+      let image = A.imgs.find(x => x.path && x.path === f.path);
+      let temp = false;
       try {
+        if (!image) {
+          const [raw] = await N.readFiles([f.path]);
+          if (!raw) throw new Error('could not read the file');
+          const file = new File([new Uint8Array(raw.bytes)], raw.name);
+          if (RAWRE.test(f.name)) {
+            image = await decodeRawToImage(file, true);
+            A.imgs.push(image);
+          } else {
+            const before = A.imgs.length;
+            await _loadFiles([file]);
+            if (A.imgs.length === before) throw new Error('the image decoder rejected this file');
+            image = A.imgs[A.imgs.length - 1];
+          }
+          image.path = f.path;
+          if (typeof EDITS !== 'undefined' && EDITS.has(f.path)) image.s = JSON.parse(JSON.stringify(EDITS.get(f.path)));
+          temp = true;
+        }
+        A.cur = A.imgs.indexOf(image); uploadAllBrushes(); uploadLUT();
+        const outName = image.name.replace(/\.[^.]+$/, '') + EXPORT.suffix + '.' + ext;
         const r = await renderFull(image, EXPORT);
         const bytes = new Uint8Array(await r.blob.arrayBuffer());
         last = dir ? await N.writeInto(dir, outName, bytes)
           : await N.saveAs(outName, [{ name: EXPORT.format.toUpperCase(), extensions: [ext] }], bytes);
-      } catch (e) { console.error(e); toast('Export failed for ' + image.name); }
+        ok++;
+      } catch (e) { console.error(e); toast('Export failed for ' + f.name); }
+      if (temp && image) {
+        // a photo decoded just for this export shouldn't linger and eat memory in a big batch
+        if (image.tex) gl.deleteTexture(image.tex);
+        (image.brushes || []).forEach(b => { if (b) { b.canvas.width = b.canvas.height = 1; } });
+        const idx = A.imgs.indexOf(image);
+        if (idx >= 0) A.imgs.splice(idx, 1);
+      }
       busy(null);
     }
-    A.cur = keep; uploadAllBrushes(); requestRender(false);
-    if (last) { toast(targets.length > 1 ? `Exported ${targets.length} photos` : 'Exported ' + last.split(/[\\/]/).pop()); N.reveal(last); }
+    A.cur = keepIm ? A.imgs.indexOf(keepIm) : -1;
+    if (A.cur >= 0) uploadAllBrushes();
+    requestRender(false);
+    if (typeof renderFolder === 'function') renderFolder();
+    if (last) toast(ok > 1 ? `Exported ${ok} photos` : ok ? 'Exported ' + last.split(/[\\/]/).pop() : 'Export failed');
+    if (last) N.reveal(last);
   };
 };
 
@@ -545,8 +610,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (A.cur < 0) { document.getElementById('drop').hidden = false; buildStrip(); }
         else selectImage(A.cur);
         break;
-      case 'export': exportDialog(false); break;
-      case 'export-all': exportDialog(true); break;
+      case 'export': exportDialog('current'); break;
+      case 'export-all': exportDialog('all'); break;
+      case 'export-selected': exportDialog('selected'); break;
       case 'convert-raw': convertRaw(); break;
       case 'select-subject': selectSubject(); break;
       case 'save-sidecar': saveSidecar(); break;
