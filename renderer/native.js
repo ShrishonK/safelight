@@ -29,31 +29,15 @@ function toHalf(v) {
   bits |= ((e - 112) << 10) | (m >> 1);
   return bits + (m & 1);
 }
-let HALF_LUT = null;
-function halfLUT() {                        // 16-bit code value -> half float of value/65535
-  if (HALF_LUT) return HALF_LUT;
-  HALF_LUT = new Uint16Array(65536);
-  for (let i = 0; i < 65536; i++) HALF_LUT[i] = toHalf(i / 65535);
-  return HALF_LUT;
-}
 
-/* ---------- raw decoding (dcraw compiled to asm.js, bundled) ---------- */
+/* ---------- raw decoding (dcraw compiled to asm.js, bundled) ----------
+   The decoder itself runs in rawworker.js; loader.js schedules it. */
 function loadScript(src) {
   return new Promise((res, rej) => {
     const s = document.createElement('script');
     s.src = src; s.onload = res; s.onerror = () => rej(new Error('could not load ' + src));
     document.head.append(s);
   });
-}
-let dcrawReady = null;
-function ensureDcraw() {
-  if (window.dcraw) return Promise.resolve();
-  if (!dcrawReady) {
-    dcrawReady = loadScript('vendor/dcraw.js')
-      .catch(() => loadScript('../node_modules/dcraw/dist/dcraw.js'))
-      .then(() => { if (!window.dcraw) throw new Error('raw decoder failed to start'); });
-  }
-  return dcrawReady;
 }
 
 function parsePPM(buf) {
@@ -73,49 +57,9 @@ function parsePPM(buf) {
   return { w, h, maxv, off: i, bytes: b };
 }
 
-async function decodeRaw(name, bytes, half) {
-  await ensureDcraw();
-  const opts = { useCameraWhiteBalance: true, use16BitLinearMode: true };
-  if (half || PREFS.halfRaw) opts.setHalfSizeMode = true;
-  let meta = {};
-  try {
-    const txt = window.dcraw(bytes, { verbose: true, identify: true });
-    if (typeof txt === 'string') {
-      const g = k => (txt.match(new RegExp(k + ':\\s*(.+)')) || [, ''])[1].trim();
-      meta = { camera: g('Camera'), iso: g('ISO speed'), shutter: g('Shutter'),
-               aperture: g('Aperture'), focal: g('Focal length'), timestamp: g('Timestamp') };
-    }
-  } catch (e) { /* metadata is a nicety, not a requirement */ }
-
-  let out;
-  try {
-    out = window.dcraw(bytes, opts);
-  } catch (e) {
-    const m = String(e && e.message || e);
-    throw new Error(/memory|allocat/i.test(m) ? 'the decoder ran out of memory on this frame' : 'the decoder failed: ' + m.slice(0, 160));
-  }
-  if (out && typeof out === 'object' && !(out instanceof Uint8Array)) out = Object.values(out)[0];
-  if (!out || typeof out === 'string' || out.length < 64) throw new Error('this file is not a raw image the decoder recognises');
-
-  const { w, h, maxv, off, bytes: pb } = parsePPM(out);
-  const n = w * h;
-  const rgba = new Uint16Array(n * 4);
-  const LUT = halfLUT();
-  const ONE = toHalf(1);
-  const scale = maxv === 255 ? 257 : 1;     // 8-bit fallback -> promote to 16-bit range
-  let p = off;
-  for (let k = 0; k < n; k++) {
-    const r = ((pb[p] << 8) | pb[p + 1]) * scale;
-    const g = ((pb[p + 2] << 8) | pb[p + 3]) * scale;
-    const b = ((pb[p + 4] << 8) | pb[p + 5]) * scale;
-    const o = k * 4;
-    rgba[o] = LUT[r > 65535 ? 65535 : r];
-    rgba[o + 1] = LUT[g > 65535 ? 65535 : g];
-    rgba[o + 2] = LUT[b > 65535 ? 65535 : b];
-    rgba[o + 3] = ONE;
-    p += 6;
-  }
-  return { w, h, rgba, meta };
+/* bytes -> { w, h, rgba (linear half floats), meta }, decoded in a worker */
+function decodeRaw(name, bytes, half) {
+  return rawJob({ bytes, half: !!(half || PREFS.halfRaw), prio: 0 }).promise;
 }
 
 function showError(title, lines) {
@@ -138,7 +82,7 @@ async function decodeRawToImage(f, quiet) {
   } catch (e1) {
     console.warn('full-size decode failed, retrying half size:', e1);
     if (!quiet) await busy('Retrying ' + f.name + ' at half size');
-    r = await decodeRaw(f.name, bytes, true);
+    r = await decodeRaw(f.name, await f.arrayBuffer(), true);
     if (!quiet) toast(f.name + ' opened at half size');
   }
   return imageFromLinear(f.name, r.w, r.h, r.rgba, r.meta);
@@ -148,10 +92,9 @@ async function decodeRawToImage(f, quiet) {
 function imageFromLinear(name, w, h, rgba, meta) {
   const im = baseImage(name, w, h, true);
   im.meta = meta || {};
-  im.tex = mkTex();
-  gl.bindTexture(gl.TEXTURE_2D, im.tex);
+  im.tex = storageTex(gl.RGBA16F, w, h);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, rgba);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.HALF_FLOAT, rgba);
   im.thumb = thumbFromHalf(rgba, w, h);
   return im;
 }
@@ -161,6 +104,7 @@ const _loadFiles = loadFiles;
 window.loadFiles = async function (files) {
   let list = [...files];
   const failed = [];
+  let opened = null;
 
   // model files arrive as a pair and install together rather than opening as photos
   const modelFiles = list.filter(f => MODEL_RE.test(f.name) || /\.(data|bin)$/i.test(f.name));
@@ -183,6 +127,14 @@ window.loadFiles = async function (files) {
         await importPresetFile(f);
         continue;
       }
+      // anything with a place on disk opens progressively, like a photo from a folder
+      const path = f.nativePath || N.pathForFile(f);
+      if (path && PHOTO_RE.test(f.name)) {
+        const im = await photoEntry(path, f.name);
+        opened = opened || im;
+        if (typeof requestThumb === 'function') requestThumb(path);
+        continue;
+      }
       if (RAWRE.test(f.name)) {
         await busy('Developing ' + f.name + ' — the first open of a raw takes a moment');
         A.imgs.push(await decodeRawToImage(f, false));
@@ -199,7 +151,8 @@ window.loadFiles = async function (files) {
   }
   document.getElementById('drop').hidden = A.imgs.length > 0;
   buildStrip();
-  if (A.cur < 0 && A.imgs.length) selectImage(0);
+  if (opened) selectImage(A.imgs.indexOf(opened));
+  else if (A.cur < 0 && A.imgs.length) selectImage(0);
   if (failed.length) showError(failed.length + ' file(s) could not be opened', failed);
 };
 
@@ -209,22 +162,27 @@ async function openNative() {
   await loadFromNative(picked);
 }
 async function loadFromNative(picked) {
-  const files = picked.map(p => {
-    const f = new File([new Uint8Array(p.bytes)], p.name);
-    f.nativePath = p.path;
-    return f;
-  });
-  await loadFiles(files);
-  // keep the source path so exports can default beside the original
-  A.imgs.forEach((im, i) => {
-    const m = picked.find(p => p.name === im.name || p.name.replace(/\.[^.]+$/, '') === im.name);
-    if (m && !im.path) im.path = m.path;
-    // a photo opened before, anywhere, picks its edits back up rather than starting blank
-    if (im.path && typeof EDITS !== 'undefined' && EDITS.has(im.path) && !im.dirty) {
-      im.s = JSON.parse(JSON.stringify(EDITS.get(im.path)));
-      im.dirty = true;
-    }
-  });
+  // photos arrive as paths and get an entry (with any saved edits) straight away;
+  // presets, sidecars and models arrive with their bytes and go through loadFiles
+  const photos = picked.filter(p => p.path && PHOTO_RE.test(p.name));
+  const rest = picked.filter(p => !photos.includes(p) && p.bytes);
+  if (rest.length) {
+    await loadFiles(rest.map(p => {
+      const f = new File([new Uint8Array(p.bytes)], p.name);
+      f.nativePath = p.path;
+      return f;
+    }));
+  }
+  let first = null;
+  for (const p of photos) {
+    const im = await photoEntry(p.path, p.name);
+    first = first || im;
+    if (typeof requestThumb === 'function') requestThumb(p.path);
+  }
+  if (first) {
+    document.getElementById('drop').hidden = true;
+    selectImage(A.imgs.indexOf(first));
+  }
 }
 
 /* ---------- export, through real save dialogs ----------
@@ -233,11 +191,10 @@ async function loadFromNative(picked) {
    decoding anything not already open on demand and freeing it right after
    so a big batch never balloons memory. */
 function exportTargets(scope) {
+  if (scope === 'current') { const im = IM(); return im ? [{ path: im.path, name: im.name }] : []; }
   if (typeof FOLDER !== 'undefined' && FOLDER.dir && FOLDER.files.length) {
     if (scope === 'selected') return FOLDER.files.filter(f => FOLDER.selected && FOLDER.selected.has(f.path));
     if (scope === 'all') return FOLDER.files.slice();
-    const f = FOLDER.files[FOLDER.cur];
-    return f ? [f] : (A.cur >= 0 ? [{ path: A.imgs[A.cur].path, name: A.imgs[A.cur].name }] : []);
   }
   // no folder open: fall back to whatever is loaded directly
   if (scope === 'selected') { toast('Open a folder to select photos'); return []; }
@@ -288,52 +245,50 @@ window.exportDialog = function (scopeArg) {
     let dir = null;
     if (scope !== 'current') { dir = await N.chooseFolder(); if (!dir) return; }
     const keepIm = A.cur >= 0 ? A.imgs[A.cur] : null;
-    let last = null, ok = 0;
+    await loadRecords(targets.map(t => t.path).filter(Boolean));
+    const entryOf = f => f.path ? photoEntrySync(f.path, f.name) : A.imgs.find(x => x.name === f.name);
+    let last = null, ok = 0, halfOnly = 0;
     for (let n = 0; n < targets.length; n++) {
       const f = targets[n];
       await busy(`Exporting ${n + 1} of ${targets.length} — ${f.name}`);
-      let image = A.imgs.find(x => x.path && x.path === f.path);
-      let temp = false;
+      const image = entryOf(f);
+      if (!image) continue;
+      const wasLoaded = image.stage !== 'cold';
+      image.pin = (image.pin || 0) + 1;
+      // start developing the next one while this one renders
+      const next = targets[n + 1] && entryOf(targets[n + 1]);
+      if (next && next !== image) { next.pin = (next.pin || 0) + 1; want(next, 'full', 2); }
       try {
-        if (!image) {
-          const [raw] = await N.readFiles([f.path]);
-          if (!raw) throw new Error('could not read the file');
-          const file = new File([new Uint8Array(raw.bytes)], raw.name);
-          if (RAWRE.test(f.name)) {
-            image = await decodeRawToImage(file, true);
-            A.imgs.push(image);
-          } else {
-            const before = A.imgs.length;
-            await _loadFiles([file]);
-            if (A.imgs.length === before) throw new Error('the image decoder rejected this file');
-            image = A.imgs[A.imgs.length - 1];
-          }
-          image.path = f.path;
-          if (typeof EDITS !== 'undefined' && EDITS.has(f.path)) image.s = JSON.parse(JSON.stringify(EDITS.get(f.path)));
-          temp = true;
-        }
-        A.cur = A.imgs.indexOf(image); uploadAllBrushes(); uploadLUT();
+        try { await ensureStage(image, 'full'); }
+        catch (e) { if (image.stage !== 'half') throw e; halfOnly++; }   // out of memory at full size: export what decoded
+        await warmBrushes(image);
         const outName = image.name.replace(/\.[^.]+$/, '') + EXPORT.suffix + '.' + ext;
-        const r = await renderFull(image, EXPORT);
+        // render with this photo's curve and brush textures bound, then put the screen's back
+        const keep = A.cur;
+        A.cur = A.imgs.indexOf(image); uploadAllBrushes(); uploadLUT();
+        const pending = renderFull(image, EXPORT);   // all GPU work happens before its first await
+        A.cur = keep; if (A.cur >= 0) { uploadAllBrushes(); uploadLUT(); }
+        const r = await pending;
         const bytes = new Uint8Array(await r.blob.arrayBuffer());
         last = dir ? await N.writeInto(dir, outName, bytes)
           : await N.saveAs(outName, [{ name: EXPORT.format.toUpperCase(), extensions: [ext] }], bytes);
         ok++;
       } catch (e) { console.error(e); toast('Export failed for ' + f.name); }
-      if (temp && image) {
-        // a photo decoded just for this export shouldn't linger and eat memory in a big batch
-        if (image.tex) gl.deleteTexture(image.tex);
-        (image.brushes || []).forEach(b => { if (b) { b.canvas.width = b.canvas.height = 1; } });
-        const idx = A.imgs.indexOf(image);
-        if (idx >= 0) A.imgs.splice(idx, 1);
+      finally {
+        image.pin--;
+        if (next && next !== image) next.pin--;
       }
+      // a photo developed just for this export shouldn't linger and eat memory in a big batch
+      if (!wasLoaded && image !== keepIm) unloadPhoto(image);
+      trimMemory();
       busy(null);
     }
     A.cur = keepIm ? A.imgs.indexOf(keepIm) : -1;
-    if (A.cur >= 0) uploadAllBrushes();
+    if (A.cur >= 0) { uploadAllBrushes(); uploadLUT(); }
     requestRender(false);
+    if (halfOnly) toast(`${halfOnly} photo${halfOnly > 1 ? 's' : ''} exported at half size — not enough memory for full`);
     if (typeof renderFolder === 'function') renderFolder();
-    if (last) toast(ok > 1 ? `Exported ${ok} photos` : ok ? 'Exported ' + last.split(/[\\/]/).pop() : 'Export failed');
+    if (last && !halfOnly) toast(ok > 1 ? `Exported ${ok} photos` : ok ? 'Exported ' + last.split(/[\\/]/).pop() : 'Export failed');
     if (last) N.reveal(last);
   };
 };
@@ -347,7 +302,9 @@ async function convertRaw() {
     if (!RAWRE.test(p.name)) continue;
     try {
       await busy('Converting ' + p.name);
-      const r = await decodeRaw(p.name, new Uint8Array(p.bytes));
+      const [file] = await N.readFiles([p.path]);
+      if (!file) throw new Error('could not read the file');
+      const r = await decodeRaw(p.name, file.bytes);
       const head = JSON.stringify(Object.assign({}, r.meta, {
         width: r.w, height: r.h, name: p.name.replace(/\.[^.]+$/, ''),
         colorspace: 'srgb-linear', format: 'rgba16f', version: 1
@@ -603,13 +560,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       case 'folder-up': if (FOLDER.parent) openFolder(FOLDER.parent); break;
       case 'close-folder': closeFolder(); break;
       case 'reveal': { const im = IM(); if (im && im.path) N.reveal(im.path); else if (FOLDER.dir) N.reveal(FOLDER.dir); } break;
-      case 'close-photo':
+      case 'close-photo': {
         if (!has) break;
-        A.imgs.splice(A.cur, 1);
-        A.cur = Math.min(A.cur, A.imgs.length - 1);
-        if (A.cur < 0) { document.getElementById('drop').hidden = false; buildStrip(); }
-        else selectImage(A.cur);
+        const at = A.cur;
+        closePhoto(IM());
+        A.cur = -1;
+        const nextI = Math.min(at, A.imgs.length - 1);
+        if (nextI < 0) { document.getElementById('drop').hidden = false; buildStrip(); requestRender(false); }
+        else selectImage(nextI);
         break;
+      }
       case 'export': exportDialog('current'); break;
       case 'export-all': exportDialog('all'); break;
       case 'export-selected': exportDialog('selected'); break;

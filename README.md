@@ -60,8 +60,11 @@ This is also how you'd ship it to anyone else.
 
 **Develops camera raw in place.** CR2, CR3, NEF, ARW, RAF, RW2, ORF, DNG and friends are
 demosaiced inside the app (dcraw, bundled) into linear 16-bit float and handed straight to
-the GPU with full highlight headroom. First open of a big raw takes a few seconds; after
-that every slider is live. JPEG, PNG and WebP open instantly.
+the GPU with full highlight headroom. Clicking a raw shows the camera's embedded JPEG
+immediately, a half-size linear develop a couple of seconds later, and the full-resolution
+demosaic finishes in the background — sliders work the whole time. The neighbouring frames
+are developed ahead of you, so stepping through a shoot rarely waits. JPEG, PNG and WebP
+open instantly.
 
 **The panel, top to bottom**
 
@@ -109,18 +112,24 @@ Drag any slider's **label** to scrub it; hold shift for fine steps; double-click
   pushing exposure on a night frame recovers real highlight detail rather than grey mush.
 - Sharpening and noise reduction are resolution-dependent, as in Lightroom — judge them at
   1:1, not fit.
-- Edits are never written to your originals. Export writes a new file; `File → Save settings
-  sidecar` writes a small `.slcar` you can re-apply later.
+- Edits are never written to your originals. Each edited photo gets a small record (settings,
+  brush paint, a developed thumbnail) in the app's data folder, so leaving a photo, closing the
+  folder or quitting never loses a look — it's only baked into pixels when you export.
+  `File → Save settings sidecar` writes a portable `.slcar` you can re-apply elsewhere.
 
 ## Layout
 
 ```
-main/main.js       window, menus, dialogs, file associations
-main/preload.js    the only bridge between the app and the OS
+main/main.js         window, menus, dialogs, file associations, edit records, thumbnail cache
+main/preview.js      pulls the embedded JPEG out of a raw without decoding it
+main/preload.js      the only bridge between the app and the OS
 renderer/index.html  interface
 renderer/app.js      the developer: WebGL2 pipeline, curves, masks, export
-renderer/native.js   desktop layer: raw decoding, native dialogs, menus, preferences
-renderer/vendor/     dcraw compiled to JavaScript
+renderer/native.js   desktop layer: native dialogs, menus, preferences, export
+renderer/loader.js   photos in memory: preview → half → full, worker pool, memory budget, edits
+renderer/rawworker.js  raw decoding off the interface thread
+renderer/folder.js   folder browser, filmstrip, thumbnails
+renderer/vendor/     dcraw compiled to JavaScript (patched; see the note at the top of dcraw.js)
 tools/rawprep.py     fallback converter if a camera the bundled decoder doesn't know shows up
 build/               icon and macOS entitlements
 ```
@@ -134,5 +143,6 @@ python tools/rawprep.py ~/shoot/*.ARW --max-dim 4000
 
 ## Requirements
 
-macOS 11+, Windows 10+, or a modern Linux. Any GPU from the last decade. About 400 MB of RAM
-per open photo, more while exporting a large raw.
+macOS 11+, Windows 10+, or a modern Linux. Any GPU from the last decade. Safelight sizes its
+photo cache to the machine (about 512 MB of textures on an 8 GB computer, less on smaller ones)
+and decodes raws in background workers that return their memory as soon as they finish.

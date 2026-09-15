@@ -372,9 +372,15 @@ function windowNoise(px, W, H) {
   return { lum: band(lum) * k, chroma: band(chr) * k };
 }
 
-function autoDenoise() {
+async function autoDenoise() {
   const im = IM();
   if (!im) { toast('Open a photo first'); return null; }
+  // noise only means something at 1:1, so a raw still on its half-size copy waits for the full decode
+  if (im.path && im.stage !== 'full' && typeof ensureStage === 'function') {
+    await busy('Loading full resolution to measure noise');
+    try { await ensureStage(im, 'full'); } catch (e) { /* measure what there is */ } finally { busy(null); }
+    if (im !== IM()) return null;
+  }
   const n = measureNoise(im);
   const s = im.s;
   // floors: sensor read noise below these is not worth smoothing
@@ -477,9 +483,9 @@ function buildStrip() {
   const st = $('#strip'); st.innerHTML = '';
   if (!A.imgs.length) { st.innerHTML = '<div class="striphint">Filmstrip<br>drop files anywhere</div>'; return; }
   A.imgs.forEach((im, i) => {
-    const d = document.createElement('div'); d.className = 'thumb' + (i === A.cur ? ' sel' : '');
-    d.innerHTML = `<img src="${im.thumb}" alt=""><div class="n">${im.name.slice(0, 12)}</div>` +
-      (im.dirty ? '<div class="edited"></div>' : '');
+    const d = document.createElement('div'); d.className = 'thumb' + (i === A.cur ? ' sel' : '') + (im.dirty ? ' is-edited' : '');
+    d.innerHTML = (im.thumb ? `<img src="${im.thumb}" alt="">` : '<img alt="">') + `<div class="n">${im.name.slice(0, 12)}</div>` +
+      '<div class="edited"></div>';
     d.addEventListener('click', () => selectImage(i));
     st.append(d);
   });
@@ -851,6 +857,14 @@ function initGL() {
   const cv = $('#gl');
   gl = cv.getContext('webgl2', { alpha: false, antialias: false, depth: false, premultipliedAlpha: false, preserveDrawingBuffer: false });
   if (!gl) { alert('This browser has no WebGL2. Try Chrome, Edge, Safari 16+ or Firefox.'); throw new Error('no webgl2'); }
+  // a GPU reset (driver update, sleep, memory pressure) takes every texture with it;
+  // edits are safe on disk, so save what's pending and start over with the same photo
+  cv.addEventListener('webglcontextlost', e => {
+    e.preventDefault();
+    try { if (typeof flushEditsSync === 'function') flushEditsSync(); } catch (err) { console.error(err); }
+    toast('The graphics driver was reset — reloading your photo');
+    setTimeout(() => location.reload(), 700);
+  });
   floatOK = !!(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'));
   gl.getExtension('OES_texture_float_linear');
   GLQ = gl.createVertexArray(); gl.bindVertexArray(GLQ);
@@ -882,16 +896,25 @@ function mkTex() {
   return t;
 }
 
+/* Fixed-size (immutable) storage. On Windows the GPU process keeps noticeably less
+   alongside these than alongside redefinable textures, and hands it back on delete. */
+function storageTex(format, w, h) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, format, w, h);
+  return t;
+}
+
 function fbo(name, w, h, float) {
   w = Math.max(1, Math.round(w)); h = Math.max(1, Math.round(h));
   const f = FBO[name];
   if (f && f.w === w && f.h === h && f.float === float) return f;
   if (f) { gl.deleteTexture(f.tex); gl.deleteFramebuffer(f.fb); }
-  const tex = mkTex();
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  const useF = float && floatOK;
-  if (useF) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
-  else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  const tex = storageTex(float && floatOK ? gl.RGBA16F : gl.RGBA8, w, h);
   const fb = gl.createFramebuffer();
   gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
@@ -938,7 +961,11 @@ function hsv2rgbJS(h, s, v) {
   return [[v, t, p], [q, v, p], [p, v, t], [p, q, v], [t, p, v], [v, p, q]][i % 6];
 }
 
+let _lutKey = '';
 function uploadLUT() {
+  const key = JSON.stringify(S().curve);
+  if (key === _lutKey) return;               // rebuilding 4 splines every frame of a drag adds up
+  _lutKey = key;
   gl.bindTexture(gl.TEXTURE_2D, LUTTEX);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, 1024, 1, 0, gl.RGBA, gl.FLOAT, buildLUT());
 }
@@ -946,6 +973,9 @@ function uploadLUT() {
 /* renders the developed image into FBO 'out' at viewport size vw x vh */
 function develop(im, vw, vh, VS_, VO_, forExport) {
   const s = im.s, G = geom(s, im.w, im.h);
+  // at fit size a full-resolution raw would be sampled one pixel in four; the half-size
+  // copy is both closer to what the eye sees at that scale and cheaper to read
+  const srcTex = im.texLo && vw / (VS_[0] * G.outW) <= 0.5 ? im.texLo : im.tex;
   const base = fbo(forExport ? 'ebase' : 'base', vw, vh, true);
   const bw = Math.max(2, Math.round(vw / 4)), bh = Math.max(2, Math.round(vh / 4));
   const b1 = fbo(forExport ? 'eb1' : 'b1', bw, bh, true);
@@ -955,7 +985,7 @@ function develop(im, vw, vh, VS_, VO_, forExport) {
   // pass 1
   let u = use(PROG.base);
   bindTarget(base);
-  gl.uniform1i(u.uSrc, tex(0, im.tex));
+  gl.uniform1i(u.uSrc, tex(0, srcTex));
   gl.uniform2f(u.uSrcSize, im.w, im.h);
   gl.uniform2f(u.uOutSize, G.outW, G.outH);
   gl.uniform2f(u.uVS, VS_[0], VS_[1]);
@@ -1282,7 +1312,7 @@ function rebuildMasks() {
       opts.append(c);
     });
     const clr = document.createElement('div'); clr.className = 'chip'; clr.textContent = 'Clear paint';
-    clr.onclick = () => { const bc = IM().brushes[m.brush]; bc.ctx.clearRect(0, 0, bc.canvas.width, bc.canvas.height); uploadBrush(m.brush); requestRender(true); };
+    clr.onclick = () => { const bc = ensureBrush(m.brush); bc.ctx.clearRect(0, 0, bc.canvas.width, bc.canvas.height); IM().brushDirty = true; uploadBrush(m.brush); requestRender(true); };
     opts.append(clr);
   }
   sl(host, 'opacity', 'Mask opacity', 0, 100, 1, 100, 'int', () => m, 'mask');
@@ -1381,6 +1411,7 @@ function duplicateMask(i) {
     to.ctx.clearRect(0, 0, to.canvas.width, to.canvas.height);
     to.ctx.drawImage(from.canvas, 0, 0, to.canvas.width, to.canvas.height);
     copy.brush = slot;
+    IM().brushDirty = true;
     uploadBrush(slot);
   }
   s.masks.splice(i + 1, 0, copy);
@@ -1414,13 +1445,14 @@ function morphBrush(idx, mode) {
   const cx = c.getContext('2d');
   cx.clearRect(0, 0, w, h);
   cx.putImageData(id, 0, 0);
+  IM().brushDirty = true;
   uploadBrush(idx);
   requestRender(true);
 }
 
 /* ---------------- brush surfaces ---------------- */
-function ensureBrush(i) {
-  const im = IM(); if (!im) return null;
+function ensureBrush(i, im) {
+  im = im || IM(); if (!im) return null;
   im.brushes = im.brushes || [];
   if (!im.brushes[i]) {
     const G = geom(im.s, im.w, im.h);
@@ -1457,6 +1489,7 @@ function paintAt(m, iuv, erase) {
   g.addColorStop(0, `rgba(255,255,255,${a})`); g.addColorStop(1, 'rgba(255,255,255,0)');
   ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); ctx.fill();
   ctx.globalCompositeOperation = 'source-over';
+  IM().brushDirty = true;
 }
 
 /* ---------------- view + render ---------------- */
@@ -1488,8 +1521,16 @@ function requestRender(commit) {
 
 function renderNow(commit) {
   const im = IM(); if (!im) { drawHisto(); return; }
-  const V = viewInfo(); if (!V) return;
   const cv = $('#gl');
+  if (typeof placeholderSync === 'function') placeholderSync(im);
+  if (typeof loadPillSync === 'function') loadPillSync();
+  cv.style.visibility = im.tex ? '' : 'hidden';
+  if (!im.tex) {                              // still loading: its thumbnail stands in
+    $('#stat').textContent = im.name;
+    drawOverlay();
+    return;
+  }
+  const V = viewInfo(); if (!V) return;
   if (cv.width !== V.vw || cv.height !== V.vh) { cv.width = V.vw; cv.height = V.vh; }
   cv.style.width = V.cssW + 'px'; cv.style.height = V.cssH + 'px';
 
@@ -1520,13 +1561,13 @@ function renderNow(commit) {
   $('#badge').hidden = !A.before; $('#badge').textContent = 'BEFORE';
 
   if (commit) {
-    im.dirty = true;
+    im.dirty = typeof isEdited === 'function' ? isEdited(im.s) : true;
     readHistogram(R.out);
     drawHisto(); drawCurve(); syncCurveBadge();
     pushHistory();
     buildStrip();
     // cache the edit to disk (debounced) so it's never lost by navigating away or quitting
-    if (im.path && typeof scheduleEditPersist === 'function') scheduleEditPersist(im.path, im.s);
+    if (im.path && typeof scheduleEditPersist === 'function') scheduleEditPersist(im);
     // and refresh the folder thumbnail so it shows the edit, not the untouched original
     if (typeof scheduleThumbRefresh === 'function') scheduleThumbRefresh(im);
   }
@@ -1575,7 +1616,7 @@ function drawOverlay() {
   ov.style.width = st.width + 'px'; ov.style.height = st.height + 'px';
   const g = ov.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, st.width, st.height);
-  const im = IM(); if (!im) return;
+  const im = IM(); if (!im || !im.tex) return;
   const V = viewInfo(); if (!V) return;
   const dot = (x, y, f) => {
     g.beginPath(); g.arc(x, y, f ? 7 : 5, 0, 6.2832);
@@ -1796,17 +1837,17 @@ async function loadFiles(files) {
 }
 
 function baseImage(name, w, h, linear) {
-  return { name, w, h, linear, s: defaults(), tex: null, brushes: [], seed: Math.random() * 40, dirty: false, hist: [], hp: -1 };
+  return { name, w, h, linear, s: defaults(), tex: null, texLo: null, stage: 'full', jobs: {}, waiters: [],
+    brushes: [], seed: Math.random() * 40, dirty: false, hist: [], hp: -1 };
 }
 
 async function loadStd(file) {
   const bmp = await createImageBitmap(file, { colorSpaceConversion: 'default' });
   const im = baseImage(file.name, bmp.width, bmp.height, false);
-  im.tex = mkTex();
-  gl.bindTexture(gl.TEXTURE_2D, im.tex);
+  im.tex = storageTex(gl.RGBA8, bmp.width, bmp.height);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
   im.thumb = thumbFromBitmap(bmp);
   bmp.close && bmp.close();
   return im;
@@ -1824,10 +1865,9 @@ async function loadFedr(file) {
   const data = new Uint16Array(buf, 8 + hlen, w * h * 4);
   const im = baseImage(head.name || file.name, w, h, true);
   im.meta = head;
-  im.tex = mkTex();
-  gl.bindTexture(gl.TEXTURE_2D, im.tex);
+  im.tex = storageTex(gl.RGBA16F, w, h);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, data);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.HALF_FLOAT, data);
   im.thumb = thumbFromHalf(data, w, h);
   if (head.camera) im.name = head.name || file.name;
   return im;
@@ -1871,6 +1911,7 @@ function selectImage(i) {
   uploadAllBrushes();
   syncAll(); rebuildMasks(); buildStrip();
   $('#drop').hidden = true;
+  if (typeof photoSelected === 'function') photoSelected(A.imgs[i]);
   requestRender(true);
 }
 
@@ -1888,7 +1929,7 @@ function freeExport() {
    without disturbing what's on screen. */
 async function renderThumb(im, longEdge) {
   const idx = A.imgs.indexOf(im);
-  if (idx < 0) return null;          // evicted before we got to it; skip rather than render with the wrong LUT
+  if (idx < 0 || !im.tex) return null;   // closed or unloaded before we got to it; skip rather than render nothing
   const keep = A.cur;
   A.cur = idx;
   try {
@@ -1897,12 +1938,10 @@ async function renderThumb(im, longEdge) {
     const k = (longEdge || 220) / Math.max(G.outW, G.outH);
     const W = Math.max(1, Math.round(G.outW * k)), H = Math.max(1, Math.round(G.outH * k));
     const R = develop(im, W, H, [1, 1], [.5, .5], true);
-    const px = new Uint8Array(W * H * 4);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, R.out.fb);
-    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
     const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
     const ctx = cv.getContext('2d'), id = ctx.createImageData(W, H);
-    id.data.set(new Uint8ClampedArray(px.buffer, px.byteOffset, px.length));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, R.out.fb);
+    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(id.data.buffer));
     for (let i = 3; i < id.data.length; i += 4) id.data[i] = 255;
     ctx.putImageData(id, 0, 0);
     freeExport();
@@ -1916,16 +1955,18 @@ async function renderThumb(im, longEdge) {
 async function renderFull(im, opts) {
   const G = geom(im.s, im.w, im.h);
   let W = Math.round(G.outW), H = Math.round(G.outH);
-  const MAXPX = 60e6;
+  // the pixel cap scales with the machine, and a render target can't exceed the GPU's texture limit
+  const MAXPX = (navigator.deviceMemory || 4) >= 8 ? 60e6 : 36e6, MT = gl.getParameter(gl.MAX_TEXTURE_SIZE);
   if (W * H > MAXPX) { const k = Math.sqrt(MAXPX / (W * H)); W = Math.round(W * k); H = Math.round(H * k); }
+  if (W > MT || H > MT) { const k = Math.min(MT / W, MT / H); W = Math.floor(W * k); H = Math.floor(H * k); }
   const R = develop(im, W, H, [1, 1], [.5, .5], true);
-  const px = new Uint8Array(W * H * 4);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, R.out.fb);
-  gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
   const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
-  const ctx = cv.getContext('2d');
+  // a CPU-backed canvas: the frame only goes to the encoder, so a GPU copy would be pure overhead
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
   const id = ctx.createImageData(W, H);
-  id.data.set(new Uint8ClampedArray(px.buffer, px.byteOffset, px.length));
+  // read straight into the ImageData: a separate buffer was one more full-size copy
+  gl.bindFramebuffer(gl.FRAMEBUFFER, R.out.fb);
+  gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(id.data.buffer));
   for (let i = 3; i < id.data.length; i += 4) id.data[i] = 255;
   ctx.putImageData(id, 0, 0);
   freeExport();
@@ -1951,6 +1992,7 @@ async function renderFull(im, opts) {
   }
   const mime = { jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp' }[opts.format];
   const blob = await new Promise(res => outCv.toBlob(res, mime, opts.quality / 100));
+  outCv.width = outCv.height = 0; cv.width = cv.height = 0;   // release the backing stores now, not at the next GC
   return { blob, w: tw, h: th, ext: opts.format === 'jpeg' ? 'jpg' : opts.format };
 }
 

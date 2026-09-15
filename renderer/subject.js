@@ -79,6 +79,7 @@ async function selectSubject() {
 
   try {
     await busy('Looking for the subject');
+    if (im.path) await ensureStage(im, 'half');    // the camera JPEG would do, but masks line up with the raw
     const sess = await segSession();
     const ort = AI.ort;
 
@@ -113,6 +114,7 @@ async function selectSubject() {
     // paint it into a brush mask so it stays editable
     const idx = s.masks.filter(m => m.type === 'brush').length;
     const b = ensureBrush(idx);
+    im.brushDirty = true;
     const small = document.createElement('canvas');
     small.width = N_; small.height = N_;
     const sg = small.getContext('2d');

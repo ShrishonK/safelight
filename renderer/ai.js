@@ -237,7 +237,13 @@ async function aiDenoise(opts) {
   opts = Object.assign({ strength: 1 }, opts);
   AI.cancel = false;
 
+  im.pin = (im.pin || 0) + 1;
   try {
+    // the network works on real pixels, so a raw still on its half-size copy waits for the full decode
+    if (im.path && im.stage !== 'full') {
+      await busy('Loading full resolution');
+      try { await ensureStage(im, 'full'); } catch (e) { if (im.stage !== 'half') throw e; }
+    }
     // Render the current develop at full size. Exposure matters: the model must
     // see the noise as it will actually appear, not as it sits in the raw file.
     await busy('Preparing the frame');
@@ -287,7 +293,7 @@ async function aiDenoise(opts) {
   } catch (e) {
     console.error(e);
     if (String(e.message) !== 'cancelled') showError('Denoise failed', [String(e.message)]);
-  } finally { busy(null); }
+  } finally { im.pin--; busy(null); }
 }
 
 /* sRGB code value -> half float of the matching linear value */

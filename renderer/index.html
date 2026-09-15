@@ -318,6 +318,31 @@
       }
     }
 
+    .thumb .open,
+    .thumb .edited {
+      display: none
+    }
+
+    .thumb.is-open .open,
+    .thumb.is-edited .edited {
+      display: block
+    }
+
+    /* thumbnails fade in as they arrive; ones scrolled far away skip layout and paint */
+    #strip .thumb {
+      content-visibility: auto;
+      contain-intrinsic-size: auto 72px
+    }
+
+    .thumb img {
+      transition: opacity .2s ease-out
+    }
+
+    .thumb.loading img,
+    .thumb img:not([src]) {
+      opacity: 0
+    }
+
     .thumb .open {
       position: absolute;
       top: 3px;
@@ -457,6 +482,45 @@
       position: absolute;
       inset: 0;
       pointer-events: none
+    }
+
+    /* the thumbnail stands in for a photo whose pixels are still on the way */
+    #placeholder {
+      position: absolute;
+      inset: 12px;
+      width: calc(100% - 24px);
+      height: calc(100% - 24px);
+      object-fit: contain;
+      pointer-events: none
+    }
+
+    #loadpill {
+      position: absolute;
+      right: 10px;
+      top: 8px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font: 400 10px/1 var(--mono);
+      color: var(--dim);
+      background: rgba(10, 14, 18, .78);
+      border: 1px solid var(--line);
+      border-radius: var(--r);
+      padding: 5px 8px;
+      pointer-events: none
+    }
+
+    #loadpill[hidden] {
+      display: none
+    }
+
+    #loadpill i {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      border: 1.5px solid var(--line-hi);
+      border-top-color: var(--amber);
+      animation: spin .8s linear infinite
     }
 
     #drop {
@@ -1016,8 +1080,10 @@
     </aside>
 
     <section id="stage">
+      <img id="placeholder" alt="" hidden>
       <canvas id="gl"></canvas>
       <canvas id="overlay"></canvas>
+      <div id="loadpill" hidden><i></i><span></span></div>
       <div id="badge" hidden></div>
       <div id="drop">
         <div>
@@ -1045,6 +1111,7 @@
   </div>
   <script src="app.js"></script>
   <script src="native.js"></script>
+  <script src="loader.js"></script>
   <script src="ai.js"></script>
   <script src="folder.js"></script>
   <script src="exif.js"></script>

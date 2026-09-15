@@ -2,12 +2,18 @@
 const { app, BrowserWindow, Menu, dialog, ipcMain, shell, nativeTheme } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
+const { extractPreview } = require('./preview');
 
 const IS_MAC = process.platform === 'darwin';
 const STORE = path.join(app.getPath('userData'), 'safelight.json');
+const EDIT_DIR = path.join(app.getPath('userData'), 'edits');     // one small file per edited photo
+const THUMB_DIR = path.join(app.getPath('userData'), 'thumbs');   // strip thumbnails, so folders reopen instantly
 
 const RAW = ['cr2', 'cr3', 'nef', 'arw', 'raf', 'rw2', 'orf', 'dng', 'pef', 'srw', 'raw', '3fr', 'iiq', 'erf', 'mrw'];
 const STILL = ['jpg', 'jpeg', 'png', 'webp', 'fedr'];
+const PHOTO_EXT = new Set([...STILL, ...RAW]);
+const isPhoto = p => PHOTO_EXT.has(path.extname(p).slice(1).toLowerCase());
 
 let win = null;
 let queued = [];          // files handed to us before the window is ready
@@ -152,14 +158,21 @@ ipcMain.handle('dialog:open', async () => {
     ]
   });
   if (r.canceled) return [];
-  return r.filePaths.map(readOne).filter(Boolean);
+  return describeAll(r.filePaths);
 });
 
-function readOne(p) {
-  try { return { path: p, name: path.basename(p), bytes: fs.readFileSync(p) }; }
+async function readOne(p) {
+  try { return { path: p, name: path.basename(p), bytes: await fs.promises.readFile(p) }; }
   catch (e) { console.error('read failed', p, e); return null; }
 }
-ipcMain.handle('file:read', (_e, paths) => paths.map(readOne).filter(Boolean));
+/* Photos travel as paths and are read one at a time by whatever needs them.
+   Handing the renderer every picked raw up front meant 25-60 MB each crossing
+   IPC at once. Presets, sidecars and models are small and still come with bytes. */
+async function describeAll(paths) {
+  const out = await Promise.all(paths.map(p => isPhoto(p) ? { path: p, name: path.basename(p) } : readOne(p)));
+  return out.filter(Boolean);
+}
+ipcMain.handle('file:read', async (_e, paths) => (await Promise.all(paths.map(readOne))).filter(Boolean));
 
 ipcMain.handle('dialog:save', async (_e, { defaultName, filters, bytes }) => {
   const st = readStore();
@@ -169,7 +182,7 @@ ipcMain.handle('dialog:save', async (_e, { defaultName, filters, bytes }) => {
     filters
   });
   if (r.canceled || !r.filePath) return null;
-  fs.writeFileSync(r.filePath, Buffer.from(bytes));
+  await fs.promises.writeFile(r.filePath, Buffer.from(bytes));
   st.lastExportDir = path.dirname(r.filePath); writeStore(st);
   return r.filePath;
 });
@@ -185,9 +198,9 @@ ipcMain.handle('dialog:folder', async () => {
   return r.filePaths[0];
 });
 
-ipcMain.handle('file:write', (_e, { dir, name, bytes }) => {
+ipcMain.handle('file:write', async (_e, { dir, name, bytes }) => {
   const p = path.join(dir, name);
-  fs.writeFileSync(p, Buffer.from(bytes));
+  await fs.promises.writeFile(p, Buffer.from(bytes));
   return p;
 });
 
@@ -231,15 +244,110 @@ ipcMain.handle('asset:read', (_e, rel) => {
 ipcMain.handle('store:get', () => readStore());
 ipcMain.handle('store:set', (_e, obj) => { writeStore(Object.assign(readStore(), obj)); return true; });
 
-/* per-photo edits, keyed by absolute path, so a look survives closing the app */
-ipcMain.handle('edits:getAll', () => readStore().edits || {});
-ipcMain.handle('edits:set', (_e, { path, settings }) => {
-  const st = readStore();
-  st.edits = st.edits || {};
-  if (settings) st.edits[path] = settings; else delete st.edits[path];
-  writeStore(st);
+/* ---------- embedded previews and the thumbnail cache ---------- */
+const sha1 = s => crypto.createHash('sha1').update(s).digest('hex');
+
+ipcMain.handle('preview:get', async (_e, { path: p, want }) => {
+  const ext = path.extname(p).slice(1).toLowerCase();
+  if (ext === 'fedr') return null;
+  if (ext === 'png' || ext === 'webp') {
+    const f = await readOne(p);
+    return f && { bytes: f.bytes, orientation: 0 };
+  }
+  return extractPreview(p, want === 'thumb' ? 'thumb' : 'large');
+});
+
+async function thumbKey(p) {
+  const st = await fs.promises.stat(p);
+  return sha1(`${p}|${st.size}|${st.mtimeMs}`);     // a re-saved file gets a fresh thumbnail
+}
+ipcMain.handle('thumb:get', async (_e, p) => {
+  try {
+    const key = await thumbKey(p);
+    try { return { bytes: await fs.promises.readFile(path.join(THUMB_DIR, key + '.jpg')), cached: true }; }
+    catch { /* not cached yet */ }
+    const ext = path.extname(p).slice(1).toLowerCase();
+    if (ext === 'fedr') return null;
+    if (ext === 'png' || ext === 'webp') { const f = await readOne(p); return f && { bytes: f.bytes, orientation: 0 }; }
+    return await extractPreview(p, 'thumb');
+  } catch (e) { return null; }
+});
+ipcMain.handle('thumb:put', async (_e, { path: p, bytes }) => {
+  try {
+    await fs.promises.mkdir(THUMB_DIR, { recursive: true });
+    await fs.promises.writeFile(path.join(THUMB_DIR, (await thumbKey(p)) + '.jpg'), Buffer.from(bytes));
+  } catch (e) { /* the cache is an optimisation */ }
   return true;
 });
+async function pruneThumbs(keep) {
+  try {
+    const names = await fs.promises.readdir(THUMB_DIR);
+    if (names.length <= keep) return;
+    const stats = await Promise.all(names.map(async n => {
+      try { return { n, t: (await fs.promises.stat(path.join(THUMB_DIR, n))).mtimeMs }; } catch { return null; }
+    }));
+    const old = stats.filter(Boolean).sort((a, b) => a.t - b.t).slice(0, names.length - keep);
+    for (const o of old) await fs.promises.unlink(path.join(THUMB_DIR, o.n)).catch(() => { });
+  } catch (e) { /* nothing cached yet */ }
+}
+
+/* ---------- per-photo edits ----------
+   Edits never touch the original file. Each edited photo gets a small record here,
+   keyed by its absolute path, so a look survives switching photos, closing the
+   folder and quitting — and is only ever baked into pixels by an export. */
+const editFile = p => path.join(EDIT_DIR, sha1(p) + '.json');
+
+function writeEditSync(p, record) {
+  const f = editFile(p);
+  if (!record) { try { fs.unlinkSync(f); } catch { } return; }
+  fs.mkdirSync(EDIT_DIR, { recursive: true });
+  fs.writeFileSync(f + '.tmp', JSON.stringify(Object.assign({}, record, { path: p })));
+  fs.renameSync(f + '.tmp', f);
+}
+async function writeEdit(p, record) {
+  const f = editFile(p);
+  if (!record) { await fs.promises.unlink(f).catch(() => { }); return; }
+  await fs.promises.mkdir(EDIT_DIR, { recursive: true });
+  // write-then-rename, so a crash mid-write never leaves a half record behind
+  const tmp = f + '.' + process.pid + '.' + Date.now() + '.tmp';
+  await fs.promises.writeFile(tmp, JSON.stringify(Object.assign({}, record, { path: p })));
+  await fs.promises.rename(tmp, f);
+}
+
+ipcMain.handle('edits:get', async (_e, paths) => {
+  let have;
+  try { have = new Set(await fs.promises.readdir(EDIT_DIR)); } catch { return {}; }
+  const out = {};
+  const want = paths.filter(p => have.has(sha1(p) + '.json'));
+  for (let i = 0; i < want.length; i += 32) {
+    await Promise.all(want.slice(i, i + 32).map(async p => {
+      try {
+        const r = JSON.parse(await fs.promises.readFile(editFile(p), 'utf8'));
+        if (r && r.path === p) out[p] = r;
+      } catch (e) { /* unreadable record: treat the photo as unedited */ }
+    }));
+  }
+  return out;
+});
+ipcMain.handle('edits:set', (_e, { path: p, record }) => writeEdit(p, record).then(() => true, e => { console.error('edit write failed', e); return false; }));
+// used while the window is closing, when an async write might not finish
+ipcMain.on('edits:flushSync', (e, list) => {
+  try { for (const { path: p, record } of list) writeEditSync(p, record); } catch (err) { console.error('edit flush failed', err); }
+  e.returnValue = true;
+});
+
+/* edits used to live inside safelight.json, rewritten whole on every change */
+function migrateEdits() {
+  const st = readStore();
+  if (!st.edits) return;
+  try {
+    for (const p of Object.keys(st.edits)) {
+      if (!fs.existsSync(editFile(p))) writeEditSync(p, { settings: st.edits[p] });
+    }
+    delete st.edits;
+    writeStore(st);
+  } catch (e) { console.error('edit migration failed', e); }
+}
 ipcMain.handle('app:info', () => ({ version: app.getVersion(), platform: process.platform, electron: process.versions.electron }));
 ipcMain.handle('shell:reveal', (_e, p) => { shell.showItemInFolder(p); });
 
@@ -247,24 +355,26 @@ ipcMain.handle('shell:reveal', (_e, p) => { shell.showItemInFolder(p); });
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) app.quit();
 else {
-  app.on('second-instance', (_e, argv) => {
+  app.on('second-instance', async (_e, argv) => {
     const files = argv.slice(1).filter(a => !a.startsWith('-') && fs.existsSync(a));
-    if (files.length) send('open-files', files.map(readOne).filter(Boolean));
+    if (files.length) send('open-files', await describeAll(files));
     if (win) { if (win.isMinimized()) win.restore(); win.focus(); }
   });
-  app.on('open-file', (e, p) => {          // macOS: double-click / drop on the dock icon
+  app.on('open-file', async (e, p) => {    // macOS: double-click / drop on the dock icon
     e.preventDefault();
     try {
       if (fs.statSync(p).isDirectory()) { send('open-folder', p); return; }
     } catch (err) { return; }
-    const f = readOne(p); if (!f) return;
+    const [f] = await describeAll([p]); if (!f) return;
     if (win && !win.isDestroyed()) send('open-files', [f]); else queued.push(f);
   });
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
+    migrateEdits();
     buildMenu();
     createWindow();
+    pruneThumbs(8000);
     const files = process.argv.slice(1).filter(a => !a.startsWith('-') && fs.existsSync(a) && fs.statSync(a).isFile());
-    if (files.length) queued.push(...files.map(readOne).filter(Boolean));
+    if (files.length) queued.push(...await describeAll(files));
     app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow(); });
   });
   app.on('window-all-closed', () => { if (!IS_MAC) app.quit(); });

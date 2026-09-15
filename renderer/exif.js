@@ -157,7 +157,7 @@ function updateCapture() {
     ['Focal length', c && c.focalText],
     ['Exposure comp.', c && c.biasText],
     ['Taken', c && c.date],
-    ['Pixels', `${im.w} × ${im.h}`],
+    ['Pixels', im.w > 1 ? `${im.w} × ${im.h}` : ''],
     ['File', im.name]
   ].filter(r => r[1]);
   body.innerHTML = rows.map(([k, v]) =>
