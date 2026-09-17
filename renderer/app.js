@@ -1531,6 +1531,7 @@ function renderNow(commit) {
     return;
   }
   const V = viewInfo(); if (!V) return;
+  if (typeof ensureFullOnZoom === 'function') ensureFullOnZoom(im);
   if (cv.width !== V.vw || cv.height !== V.vh) { cv.width = V.vw; cv.height = V.vh; }
   cv.style.width = V.cssW + 'px'; cv.style.height = V.cssH + 'px';
 

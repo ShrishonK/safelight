@@ -122,6 +122,8 @@ function buildMenu() {
       { label: 'Show original', accelerator: 'CmdOrCtrl+B', click: menuSend('before') },
       { label: 'Show mask overlay', accelerator: 'CmdOrCtrl+M', click: menuSend('overlay') },
       { type: 'separator' },
+      { label: 'Cull mode', accelerator: 'CmdOrCtrl+Shift+K', click: menuSend('cull') },
+      { type: 'separator' },
       { label: 'Next photo', accelerator: 'CmdOrCtrl+Right', click: menuSend('next') },
       { label: 'Previous photo', accelerator: 'CmdOrCtrl+Left', click: menuSend('prev') },
       { type: 'separator' },
@@ -231,6 +233,88 @@ ipcMain.handle('folder:pick', async () => {
   if (r.canceled || !r.filePaths[0]) return null;
   st.lastFolder = r.filePaths[0]; writeStore(st);
   return r.filePaths[0];
+});
+
+/* ---------- culling: keepers move to a folder of their own ----------
+   Nothing is ever overwritten, a move across drives copies before it deletes,
+   and a photo's edits follow it to its new path. */
+ipcMain.handle('dialog:cullOut', async () => {
+  const st = readStore();
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Choose a folder for the photos you keep',
+    properties: ['openDirectory', 'createDirectory'],
+    defaultPath: st.cullOut || app.getPath('pictures')
+  });
+  if (r.canceled || !r.filePaths[0]) return null;
+  st.cullOut = r.filePaths[0]; writeStore(st);
+  return r.filePaths[0];
+});
+
+async function freeName(dir, name) {
+  const ext = path.extname(name), base = name.slice(0, name.length - ext.length);
+  for (let n = 1; n < 1000; n++) {
+    const dest = path.join(dir, n === 1 ? name : `${base} (${n})${ext}`);
+    try { await fs.promises.access(dest); } catch { return dest; }
+  }
+  throw new Error('too many files by that name in the destination');
+}
+
+async function moveOne(from, toDir, toName) {
+  await fs.promises.mkdir(toDir, { recursive: true });
+  const dest = await freeName(toDir, toName || path.basename(from));
+  try {
+    await fs.promises.rename(from, dest);
+  } catch (e) {
+    if (e.code !== 'EXDEV') throw e;
+    // a different drive: copy, check it arrived whole, and only then remove the original
+    const st = await fs.promises.stat(from);
+    await fs.promises.copyFile(from, dest, fs.constants.COPYFILE_EXCL);
+    const got = await fs.promises.stat(dest);
+    if (got.size !== st.size) {
+      await fs.promises.unlink(dest).catch(() => { });
+      throw new Error('the copy came out a different size, so the original was left alone');
+    }
+    await fs.promises.utimes(dest, st.atime, st.mtime).catch(() => { });   // keeps its cached thumbnail
+    await fs.promises.unlink(from);
+  }
+  return dest;
+}
+
+function moveEditRecord(from, to) {
+  try {
+    const src = editFile(from);
+    if (!fs.existsSync(src)) return;
+    const rec = JSON.parse(fs.readFileSync(src, 'utf8'));
+    writeEditSync(to, rec);
+    fs.unlinkSync(src);
+  } catch (e) { console.error('could not move the edit record', e); }
+}
+
+/* system error codes, said plainly */
+function moveTrouble(e) {
+  const by = {
+    ENOENT: 'the file is not there any more',
+    EPERM: 'Windows would not let go of the file — is it open somewhere else?',
+    EACCES: 'no permission to move that file',
+    EBUSY: 'the file is in use by another program',
+    ENOSPC: 'the destination drive is full',
+    EROFS: 'the destination is read-only'
+  }[e.code];
+  return by || e.message;
+}
+
+ipcMain.handle('cull:move', async (_e, items) => {
+  const out = [];
+  for (const it of items) {
+    try {
+      const to = await moveOne(it.from, it.toDir, it.toName);
+      moveEditRecord(it.from, to);
+      out.push({ from: it.from, to });
+    } catch (e) {
+      out.push({ from: it.from, error: moveTrouble(e) });
+    }
+  }
+  return out;
 });
 
 ipcMain.handle('asset:read', (_e, rel) => {

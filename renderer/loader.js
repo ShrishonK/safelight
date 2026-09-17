@@ -174,9 +174,9 @@ async function openPath(path, name) {
 }
 
 /* forget an entry entirely: its edits are already on disk */
-function closePhoto(im) {
+function closePhoto(im, skipSave) {
   if (!im) return;
-  if (im.path) persistNow(im);
+  if (im.path && !skipSave) persistNow(im);
   cancelJobs(im);
   dropTextures(im);
   (im.brushes || []).forEach(b => { if (b) b.canvas.width = b.canvas.height = 1; });
@@ -188,6 +188,18 @@ function closePhoto(im) {
   A.imgs.splice(i, 1);
   if (i < A.cur) A.cur--;
   else if (wasCur) A.cur = -1;
+}
+
+/* the file has moved elsewhere: drop the entry, and don't write its edits back here */
+function forgetPhoto(path) {
+  const im = PHOTOS.get(path);
+  if (im) {
+    clearTimeout(_persistTimers.get(path));
+    _persistTimers.delete(path);
+    closePhoto(im, true);
+  }
+  RECORDS.delete(path);
+  CHECKED.delete(path);
 }
 
 /* entries from other folders that aren't on screen are closed when the folder changes */
@@ -539,6 +551,16 @@ function want(im, stage, prio) {
   }
 }
 
+function warmPreview(im) {
+  if (im.kind === 'raw' && rank(im) < RANK.preview && !im.jobs.preview) im.jobs.preview = loadPreview(im);
+}
+
+/* zooming past fit is the moment full resolution starts to matter */
+function ensureFullOnZoom(im) {
+  if (!im || !im.path || A.view.fit || rank(im) >= RANK.full || im.jobs.full) return;
+  if (A.view.zoom > (A.view.fitZoom || 0) * 1.05) want(im, 'full', 0);
+}
+
 function ensureStage(im, stage) {
   const target = im.kind === 'raw' || !im.path ? stage : 'full';
   if (!im.path || rank(im) >= RANK[target]) return Promise.resolve(im);
@@ -675,7 +697,8 @@ function photoSelected(im) {
     if (other.jobs.half && !near(other.path)) cancelJobs(other, 'half');
   }
   want(im, 'half', 0);
-  want(im, 'full', 0);
+  // while culling, the 25-second full decode waits until you zoom in to check focus
+  if (!(typeof CULL !== 'undefined' && CULL.on && A.view.fit)) want(im, 'full', 0);
   clearTimeout(_neighbourTimer);
   _neighbourTimer = setTimeout(() => prefetchAround(im), 250);
   clearTimeout(_lastPhotoTimer);
@@ -687,14 +710,19 @@ function photoSelected(im) {
 /* the next frames you're likely to look at, decoded at half size while you look at this one */
 function prefetchAround(im) {
   if (typeof FOLDER === 'undefined' || !FOLDER.dir || im !== IM()) return;
-  const i = FOLDER.files.findIndex(f => f.path === im.path);
+  const list = typeof stripFiles === 'function' ? stripFiles() : FOLDER.files;
+  const i = list.findIndex(f => f.path === im.path);
   if (i < 0) return;
-  const near = [i + 1, i - 1, i + 2, i + 3, i - 2].filter(k => k >= 0 && k < FOLDER.files.length);
+  const culling = typeof CULL !== 'undefined' && CULL.on;
+  const near = [i + 1, i - 1, i + 2, i + 3, i - 2].filter(k => k >= 0 && k < list.length);
   const keep = new Set([im.path]);
   near.forEach((k, n) => {
-    const f = FOLDER.files[k];
+    const f = list[k];
     keep.add(f.path);
-    want(photoEntrySync(f.path, f.name), 'half', 10 + n);
+    const e = photoEntrySync(f.path, f.name);
+    // culling is about the next picture appearing at once, so reach further with previews
+    if (culling && n >= 2) warmPreview(e);
+    else want(e, 'half', 10 + n);
   });
   for (const other of PHOTOS.values()) {
     if (keep.has(other.path) || other.pin) continue;

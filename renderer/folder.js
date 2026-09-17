@@ -17,6 +17,12 @@ const THUMB_EDGE = 360;
 
 const isRawPath = n => RAWRE.test(n);
 
+/* what the filmstrip shows: everything, unless Cull mode is filtering by file type */
+function stripFiles() {
+  if (typeof CULL === 'undefined' || !CULL.on || CULL.filter === 'all') return FOLDER.files;
+  return FOLDER.files.filter(f => cullMatches(f.name));
+}
+
 /* ---------- opening ---------- */
 async function openFolder(dir, reopenPhoto) {
   if (!dir) return;
@@ -39,6 +45,7 @@ async function openFolder(dir, reopenPhoto) {
   document.getElementById('crumb').textContent = r.dir;
   document.getElementById('crumb').title = r.dir;
   N.storeSet({ lastFolder: r.dir });
+  if (typeof loadPicksForFolder === 'function') loadPicksForFolder();
   renderFolder();
   toast(`${r.files.length} photo${r.files.length === 1 ? '' : 's'} in ${r.name}`);
   // every thumbnail in the folder, visible ones first, so scrolling never waits
@@ -88,8 +95,14 @@ function renderFolder() {
     strip.innerHTML = '<div class="striphint">No photos in this folder</div>';
     return;
   }
+  const list = stripFiles();
+  if (!list.length) {
+    strip.innerHTML = '<div class="striphint">No files of that type in this folder</div>';
+    return;
+  }
+  const at = new Map(FOLDER.files.map((f, i) => [f.path, i]));
   const frag = document.createDocumentFragment();
-  FOLDER.files.forEach((f, i) => frag.append(fileThumb(f, i)));
+  list.forEach(f => frag.append(fileThumb(f, at.get(f.path))));
   strip.append(frag);
   _stripCur = null;
   syncStrip();
@@ -138,7 +151,9 @@ function fileThumb(f, i) {
   const cap = document.createElement('div'); cap.className = 'n'; cap.textContent = f.name;
   const ed = document.createElement('div'); ed.className = 'edited';
   const op = document.createElement('div'); op.className = 'open';
-  d.append(img, cap, ed, op);
+  const fl = document.createElement('div'); fl.className = 'flag';
+  d.append(img, cap, ed, op, fl);
+  if (typeof CULL !== 'undefined' && CULL.picks.has(f.path)) d.classList.add('is-flagged');
   if (FOLDER.selectMode) { const s = document.createElement('div'); s.className = 'sel-badge'; d.append(s); }
   d.onclick = () => FOLDER.selectMode ? toggleSelect(f.path) : openPhotoAt(i);
   d.oncontextmenu = e => { e.preventDefault(); showThumbMenu(e, f); };
@@ -151,17 +166,20 @@ let _stripCur = null;
 function syncStrip() {
   if (!FOLDER.dir) { renderFolder(); return; }
   const cur = IM(), curPath = cur && cur.path;
+  const culling = typeof CULL !== 'undefined' && CULL.on;
   for (const [p, el] of THUMB_EL) {
     const im = PHOTOS.get(p);
     el.classList.toggle('sel', p === curPath);
     el.classList.toggle('is-edited', im ? !!im.dirty : RECORDS.has(p));
     el.classList.toggle('is-open', !!(im && im.tex));
+    if (culling) el.classList.toggle('is-flagged', CULL.picks.has(p));
   }
   if (curPath !== _stripCur) {
     _stripCur = curPath;
     const el = curPath && THUMB_EL.get(curPath);
-    if (el) el.scrollIntoView({ block: 'nearest' });
+    if (el) el.scrollIntoView({ block: 'nearest', inline: 'center' });
   }
+  if (culling) cullSync();
 }
 
 function setThumbImage(path, src) {
@@ -378,10 +396,27 @@ function openPhotoAt(i) {
 
 function stepPhoto(delta) {
   if (!FOLDER.dir || !FOLDER.files.length) return false;
-  const next = clamp(FOLDER.cur + delta, 0, FOLDER.files.length - 1);
-  if (next === FOLDER.cur) return true;
-  openPhotoAt(next);
+  const list = stripFiles();
+  if (!list.length) return false;
+  const cur = IM();
+  let at = cur ? list.findIndex(f => f.path === cur.path) : -1;
+  if (at < 0) at = delta > 0 ? -1 : list.length;          // off the end: step in from either side
+  const f = list[clamp(at + delta, 0, list.length - 1)];
+  if (!f || (cur && f.path === cur.path)) return true;
+  openPhotoAt(FOLDER.files.indexOf(f));
   return true;
+}
+
+/* re-read the folder after files have moved in or out of it */
+async function refreshFolder() {
+  if (!FOLDER.dir) return;
+  const r = await N.scanFolder(FOLDER.dir);
+  if (!r || r.error) return;
+  FOLDER.folders = r.folders; FOLDER.files = r.files; FOLDER.parent = r.parent;
+  const cur = IM();
+  FOLDER.cur = cur ? r.files.findIndex(f => f.path === cur.path) : -1;
+  renderFolder();
+  r.files.forEach(f => requestThumb(f.path, false));
 }
 
 /* ---------- wiring ---------- */

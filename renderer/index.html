@@ -19,6 +19,7 @@
       --amber: #e9a23b;
       --amber-dim: #8a6224;
       --clip: #ff5c4d;
+      --keep: #56c271;
       --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
       --ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       --r: 3px;
@@ -42,7 +43,7 @@
       overflow: hidden;
       -webkit-font-smoothing: antialiased;
       display: grid;
-      grid-template-rows: 40px 1fr;
+      grid-template-rows: 40px auto 1fr auto;
     }
 
     button,
@@ -140,6 +141,152 @@
     .tb[disabled] {
       opacity: .35;
       pointer-events: none
+    }
+
+    /* ---------- mode tabs ---------- */
+    .tabs {
+      display: flex;
+      gap: 2px;
+      background: var(--sunk);
+      border: 1px solid var(--line);
+      border-radius: var(--r);
+      padding: 2px;
+      margin-right: 2px
+    }
+
+    .tab {
+      background: none;
+      border: 0;
+      border-radius: 2px;
+      padding: 4px 11px;
+      font: 500 10px/1.2 var(--mono);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--dim);
+      cursor: pointer
+    }
+
+    .tab:hover {
+      color: var(--text)
+    }
+
+    .tab.on {
+      background: var(--panel-2);
+      color: var(--amber)
+    }
+
+    /* ---------- cull mode ---------- */
+    #cullbar {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line)
+    }
+
+    body.cull #cullbar {
+      display: flex
+    }
+
+    #cullbar .clabel {
+      font: 500 9px var(--mono);
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--faint)
+    }
+
+    #cullbar .cpath {
+      font: 400 11px var(--mono);
+      color: var(--dim);
+      max-width: 22vw;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap
+    }
+
+    #cullbar .tb {
+      padding: 4px 8px;
+      font-size: 11px
+    }
+
+    #cullCount {
+      color: var(--amber)
+    }
+
+    #cullstrip {
+      display: none;
+      background: var(--panel);
+      border-top: 1px solid var(--line);
+      min-height: 0
+    }
+
+    body.cull #cullstrip {
+      display: block;
+      height: 150px
+    }
+
+    body.cull #side,
+    body.cull #insp {
+      display: none
+    }
+
+    body.cull main {
+      grid-template-columns: minmax(0, 1fr)
+    }
+
+    /* the same filmstrip element, laid out along the bottom while culling */
+    body.cull #strip {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      height: 100%;
+      overflow-x: auto;
+      overflow-y: hidden;
+      gap: 8px;
+      padding: 10px
+    }
+
+    body.cull #strip .thumb {
+      width: 172px;
+      flex: 0 0 auto
+    }
+
+    .thumb .flag {
+      display: none;
+      position: absolute;
+      left: 4px;
+      bottom: 16px;
+      width: 13px;
+      height: 13px;
+      border-radius: 3px;
+      background: var(--keep);
+      box-shadow: 0 0 0 1px rgba(0, 0, 0, .55)
+    }
+
+    .thumb.is-flagged .flag {
+      display: block
+    }
+
+    .thumb.is-flagged {
+      outline: 2px solid var(--keep);
+      outline-offset: -2px
+    }
+
+    #flagbadge {
+      position: absolute;
+      left: 10px;
+      top: 8px;
+      font: 500 10px/1 var(--mono);
+      letter-spacing: .12em;
+      color: #08130c;
+      background: var(--keep);
+      border-radius: var(--r);
+      padding: 5px 8px
+    }
+
+    #flagbadge[hidden] {
+      display: none
     }
 
     .sep {
@@ -1041,6 +1188,10 @@
 <body>
   <header>
     <div class="mark">Safelight<span>/dev</span></div>
+    <div class="tabs">
+      <button class="tab on" id="tabDevelop" title="Develop">Develop</button>
+      <button class="tab" id="tabCull" title="Cull (Ctrl+Shift+K)">Cull</button>
+    </div>
     <button class="tb" id="btnOpen">Open photos</button>
     <input type="file" id="file" multiple accept="image/*,.fedr" hidden>
     <div class="sep"></div>
@@ -1057,6 +1208,26 @@
     <button class="tb" id="btnExport">Export…</button>
     <button class="tb primary" id="btnExportAll">Export all</button>
   </header>
+
+  <div id="cullbar" hidden>
+    <span class="clabel">In</span>
+    <span class="cpath" id="cullIn">no folder open</span>
+    <button class="tb" id="cullPickIn">Folder…</button>
+    <span class="clabel">Keep in</span>
+    <span class="cpath" id="cullOut">choose a folder</span>
+    <button class="tb" id="cullPickOut">Output folder…</button>
+    <div class="spacer"></div>
+    <span class="stat" id="cullCount">nothing flagged</span>
+    <button class="tb" id="cullUndo" hidden>Move back</button>
+    <button class="tb primary" id="cullMove">Move</button>
+    <select id="cullFilter" title="Which files to show">
+      <option value="all">All files</option>
+      <option value="raw">Raw only</option>
+      <option value="jpeg">JPEG only</option>
+      <option value="png">PNG · WebP</option>
+      <option value="fedr">.fedr only</option>
+    </select>
+  </div>
 
   <main>
     <aside id="side">
@@ -1085,6 +1256,7 @@
       <canvas id="overlay"></canvas>
       <div id="loadpill" hidden><i></i><span></span></div>
       <div id="badge" hidden></div>
+      <div id="flagbadge" hidden>KEEP</div>
       <div id="drop">
         <div>
           <b>Drop photos here</b>
@@ -1098,6 +1270,8 @@
 
     <aside id="insp"></aside>
   </main>
+
+  <div id="cullstrip" hidden></div>
 
   <div id="modal">
     <div class="card" id="card"></div>
@@ -1114,6 +1288,7 @@
   <script src="loader.js"></script>
   <script src="ai.js"></script>
   <script src="folder.js"></script>
+  <script src="cull.js"></script>
   <script src="exif.js"></script>
   <script src="subject.js"></script>
 </body>

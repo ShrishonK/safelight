@@ -21,6 +21,8 @@ contextBridge.exposeInMainWorld('native', {
   editsGet: (paths) => ipcRenderer.invoke('edits:get', paths),
   editsSet: (path, record) => ipcRenderer.invoke('edits:set', { path, record }),
   editsFlushSync: (list) => ipcRenderer.sendSync('edits:flushSync', list),
+  pickCullOut: () => ipcRenderer.invoke('dialog:cullOut'),
+  cullMove: (items) => ipcRenderer.invoke('cull:move', items),
   info: () => ipcRenderer.invoke('app:info'),
   onMenu: (cb) => ipcRenderer.on('menu', (_e, cmd) => cb(cmd)),
   onOpenFiles: (cb) => ipcRenderer.on('open-files', (_e, files) => cb(files)),
