@@ -13,10 +13,17 @@ const AI = {
   ort: null,
   session: null,
   modelName: null,
-  tile: 512,
+  device: 'auto', // 'auto' | 'gpu' | 'cpu'
+  tile: 0,        // 0 = pick from the backend (see tileFor)
   overlap: 96,    // deep networks darken well beyond a few pixels at a tile edge
   cancel: false
 };
+
+/* Every tile repeats the overlap, so small tiles waste work: at 512 px with this
+   overlap the network computes 2.6x the frame, at 768 px 1.8x. The GPU gets the
+   bigger tile. The threaded CPU runtime can't: SCUNet at 640 px or more runs out of
+   WebAssembly memory once its threads each hold working buffers, so it stays at 512. */
+const tileFor = backend => AI.tile || (backend === 'webgpu' ? 768 : 512);
 
 /* the model is large, so it lives in IndexedDB after the first fetch */
 const MODEL_DB = 'safelight-models';
@@ -63,11 +70,33 @@ async function ensureOrt() {
   const ort = window.ort;
   if (!ort) throw new Error('the inference runtime failed to load');
   // must be an absolute URL: a bare relative path is treated as a module specifier
-  ort.env.wasm.wasmPaths = new URL('vendor/ort/', document.baseURI).href;
-  ort.env.wasm.numThreads = 1;          // file:// has no cross-origin isolation
+  const base = new URL('vendor/ort/', document.baseURI).href;
+  ort.env.wasm.wasmPaths = base;
+  ort.env.wasm.numThreads = 1;
+  // main.js turns SharedArrayBuffer on, so the CPU path can use worker threads.
+  // The threaded runtime spawns its workers from its own module URL, and a file://
+  // page can't fetch() that, so hand it the module as a blob read over IPC instead.
+  const cores = navigator.hardwareConcurrency || 2;
+  if (typeof SharedArrayBuffer !== 'undefined' && cores > 2 && window.native) {
+    try {
+      const r = await N.readAsset('vendor/ort/ort-wasm-simd-threaded.jsep.mjs');
+      if (r && r.bytes) {
+        const mjs = URL.createObjectURL(new Blob([r.bytes], { type: 'text/javascript' }));
+        ort.env.wasm.wasmPaths = { mjs, wasm: base + 'ort-wasm-simd-threaded.jsep.wasm' };
+        ort.env.wasm.numThreads = Math.min(8, cores - 2);   // leave room for the UI and the GPU driver
+      }
+    } catch (e) { console.warn('threaded runtime unavailable, staying single-threaded', e); }
+  }
+  // laptops with two GPUs should get the discrete one
+  ort.env.webgpu.powerPreference = 'high-performance';
   ort.env.logLevel = 'error';
   AI.ort = ort;
   return ort;
+}
+
+/* the webgpu backend only publishes its adapter once it actually came up */
+function webgpuLive(ort) {
+  try { return !!(ort.env.webgpu && ort.env.webgpu.adapter); } catch { return false; }
 }
 
 async function haveWebGPU() {
@@ -85,20 +114,28 @@ async function loadModel(key, rec, onProgress) {
   // older records were a bare Uint8Array
   if (rec instanceof Uint8Array || rec instanceof ArrayBuffer) rec = { main: rec, ext: [] };
   if (onProgress) onProgress('Starting the model');
-  const gpu = await haveWebGPU();
+  const gpu = AI.device !== 'cpu' && await haveWebGPU();
+  if (AI.device === 'gpu' && !gpu) throw new Error('no WebGPU adapter on this machine — set Device to Auto or CPU');
   const providers = gpu ? ['webgpu', 'wasm'] : ['wasm'];
   const opts = { executionProviders: providers, graphOptimizationLevel: 'all' };
   // Big exports keep their weights in a sibling .onnx.data file; the graph refers
   // to it by relative name, so hand it over under exactly that name.
   if (rec.ext && rec.ext.length) opts.externalData = rec.ext.map(e => ({ path: e.path, data: e.data }));
+  if (AI.session) { try { await AI.session.release(); } catch { } AI.session = null; }
+  let onGpu = gpu;
   try {
     AI.session = await ort.InferenceSession.create(rec.main, opts);
+    // ORT drops an execution provider that fails to start without saying so
+    onGpu = gpu && webgpuLive(ort);
   } catch (e) {
     if (!gpu) throw e;
     AI.session = await ort.InferenceSession.create(rec.main, Object.assign({}, opts, { executionProviders: ['wasm'] }));
+    onGpu = false;
   }
   AI.modelName = key;
-  AI.backend = gpu ? 'webgpu' : 'wasm';
+  AI.loadedDevice = AI.device;
+  AI.backend = onGpu ? 'webgpu' : 'wasm';
+  AI.label = onGpu ? 'GPU' : `CPU × ${ort.env.wasm.numThreads} thread${ort.env.wasm.numThreads === 1 ? '' : 's'}`;
   return AI.session;
 }
 
@@ -118,7 +155,19 @@ async function loadBuiltinDenoise() {
 /* ---------- pixel plumbing ----------
    Models of this kind are trained on gamma-encoded RGB in 0..1, so the
    linear working image is encoded on the way in and decoded on the way out. */
-function tileToTensor(ort, rgba, W, H, x0, y0, tw, th) {
+/* fp16 exports run roughly twice as fast on GPUs that support shader-f16 */
+let _h2f = null;
+function halfToFloatLUT() {
+  if (_h2f) return _h2f;
+  _h2f = new Float32Array(65536);
+  for (let i = 0; i < 65536; i++) _h2f[i] = half2f(i);
+  return _h2f;
+}
+function modelIsHalf(sess) {
+  try { return sess.inputMetadata[0].type === 'float16'; } catch { return false; }
+}
+
+function tileToTensor(ort, rgba, W, H, x0, y0, tw, th, half) {
   const data = new Float32Array(3 * tw * th);
   const plane = tw * th;
   for (let y = 0; y < th; y++) {
@@ -131,6 +180,11 @@ function tileToTensor(ort, rgba, W, H, x0, y0, tw, th) {
       data[2 * plane + d] = rgba[s + 2] / 255;
     }
   }
+  if (half) {
+    const h = new Uint16Array(data.length);
+    for (let i = 0; i < data.length; i++) h[i] = toHalf(data[i]);
+    return new ort.Tensor('float16', h, [1, 3, th, tw]);
+  }
   return new ort.Tensor('float32', data, [1, 3, th, tw]);
 }
 
@@ -142,16 +196,50 @@ function featherWeight(i, n, overlap) {
   return Math.max(w, 1e-4);
 }
 
-/* run the model over one RGBA byte image, returning denoised RGB floats 0..1 */
+/* Some exports fix the spatial input size instead of leaving it dynamic (e.g. a
+   320x320-only graph); feeding such a model any other size fails outright at
+   OrtRun with a dimension mismatch. Read the declared shape back off the session
+   so tiling respects it instead of always assuming the configured tile fits. */
+function modelFixedSize(sess) {
+  try {
+    const shape = sess.inputMetadata && sess.inputMetadata[0] && sess.inputMetadata[0].shape;
+    if (!shape || shape.length !== 4) return null;
+    const h = shape[2], w = shape[3];
+    return (typeof h === 'number' && typeof w === 'number' && h > 0 && w > 0 && h === w) ? h : null;
+  } catch { return null; }
+}
+
+/* run the model over one RGBA byte image, returning denoised RGB floats 0..1.
+   A big tile can exhaust GPU memory on a small card; that shows up on the first
+   tile, so halve the tile and start over rather than give up. */
 async function runModel(rgba, W, H, onProgress) {
-  const ort = AI.ort, sess = AI.session;
+  const sess = AI.session;
   if (!sess) throw new Error('no model loaded');
+  const fixed = modelFixedSize(sess);
+  let tile = tileFor(AI.backend);
+  for (;;) {
+    try {
+      return await runTiles(rgba, W, H, fixed || tile, onProgress);
+    } catch (e) {
+      if (e.firstTile && !fixed && tile > 256 && !AI.cancel) {
+        console.warn(`denoise: ${tile}px tiles failed (${e.message}), retrying at ${tile / 2}px`);
+        tile /= 2;
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+async function runTiles(rgba, W, H, tile, onProgress) {
+  const ort = AI.ort, sess = AI.session;
   const inName = sess.inputNames[0], outName = sess.outputNames[0];
+  const half = modelIsHalf(sess), H2F = half ? halfToFloatLUT() : null;
   const OV = AI.overlap;
   // Networks with several downsampling stages need sides that are a multiple of 64,
   // or they return a differently sized tensor and everything after this is garbage.
   const round64 = n => Math.max(64, Math.ceil(n / 64) * 64);
-  const T = Math.min(round64(AI.tile), round64(Math.max(W, H) + 2 * OV));
+  const T = modelFixedSize(sess) || Math.min(round64(tile), round64(Math.max(W, H) + 2 * OV));
   const step = Math.max(64, T - OV * 2);
 
   // Tiles overhang the frame by the overlap and sample replicated edge pixels.
@@ -171,7 +259,7 @@ async function runModel(rgba, W, H, onProgress) {
   for (const y0 of ys) {
     for (const x0 of xs) {
       if (AI.cancel) throw new Error('cancelled');
-      const input = tileToTensor(ort, rgba, W, H, x0, y0, T, T);
+      const input = tileToTensor(ort, rgba, W, H, x0, y0, T, T, half);
       let res;
       try {
         res = await sess.run({ [inName]: input });
@@ -182,15 +270,18 @@ async function runModel(rgba, W, H, onProgress) {
           AI.tile = wanted;
           AI.overlap = Math.max(16, Math.min(AI.overlap, Math.floor(AI.tile / 4)));
           if (onProgress) onProgress(`Retrying at tile size ${AI.tile}`);
-          return runModel(rgba, W, H, onProgress);
+          return runTiles(rgba, W, H, wanted, onProgress);
         }
+        if (done === 0) e.firstTile = true;
         throw e;
       }
       const tensor = res[outName];
       if (tensor.dims.length === 4 && tensor.dims[1] === 1) {
         throw new Error('that model outputs a single-channel mask, not a photo — it is a segmentation model, not a denoiser');
       }
-      const o = tensor.data, plane = T * T;
+      let o = tensor.data;
+      if (half) { const f = new Float32Array(o.length); for (let i = 0; i < o.length; i++) f[i] = H2F[o[i]]; o = f; }
+      const plane = T * T;
       for (let y = 0; y < T; y++) {
         const gy = y0 + y;
         if (gy < 0 || gy >= H) continue;
@@ -206,8 +297,9 @@ async function runModel(rgba, W, H, onProgress) {
           wsum[gy * W + gx] += w;
         }
       }
+      if (tensor.dispose) tensor.dispose();
       done++;
-      if (onProgress) onProgress(`Denoising tile ${done} of ${total}`);
+      if (onProgress) onProgress(`Denoising tile ${done} of ${total} · ${AI.label}`);
       await new Promise(r => setTimeout(r, 0));   // let the UI breathe
     }
   }
@@ -289,7 +381,7 @@ async function aiDenoise(opts) {
     A.imgs.splice(A.cur + 1, 0, ni);
     buildStrip();
     selectImage(A.cur + 1);
-    toast(`Denoised in ${secs}s on ${AI.backend} \u00b7 new frame added`);
+    toast(`Denoised in ${secs}s on ${AI.label} \u00b7 new frame added`);
   } catch (e) {
     console.error(e);
     if (String(e.message) !== 'cancelled') showError('Denoise failed', [String(e.message)]);
@@ -343,13 +435,18 @@ async function aiModelDialog() {
       </select></div>
       <div class="field"><span>Add a model</span><button class="tb" id="aiAdd">Choose files…</button></div>
       <div class="field"><span>Strength</span><input type="number" id="aiStr" min="10" max="100" step="5" value="100"></div>
-      <div class="hint">Suggested: SCUNet colour real, or NAFNet SIDD. You can also drag the model
-      files straight onto the window.</div>
+      <div class="field"><span>Device</span><select id="aiDev">
+        <option value="auto">Auto (GPU if available)</option><option value="gpu">GPU</option><option value="cpu">CPU</option>
+      </select></div>
+      <div class="hint">Suggested: SCUNet colour real, or NAFNet SIDD. NAFNet is several times faster than
+      SCUNet, and an fp16 export of either runs about twice as fast on a GPU. You can also drag the
+      model files straight onto the window.</div>
     </div>
     <div class="foot">
       <button class="tb" id="aiCancel">Close</button>
       <button class="tb primary" id="aiRun">Denoise</button>
     </div>`;
+  document.getElementById('aiDev').value = AI.device;
   document.getElementById('modal').classList.add('open');
   document.getElementById('aiCancel').onclick = () => document.getElementById('modal').classList.remove('open');
   document.getElementById('aiAdd').onclick = async () => {
@@ -359,7 +456,7 @@ async function aiModelDialog() {
     await busy('Installing the model');
     try {
       const r = await installModelFiles(picked);
-      toast(`Model ready: ${r.name} · ${r.mb} MB · ${AI.backend}`);
+      toast(`Model ready: ${r.name} · ${r.mb} MB · ${AI.label}`);
       aiModelDialog();
     } catch (e) { showError('That model would not load', [String(e.message)]); }
     finally { busy(null); }
@@ -367,9 +464,11 @@ async function aiModelDialog() {
   document.getElementById('aiRun').onclick = async () => {
     const key = document.getElementById('aiPick').value;
     const strength = (parseInt(document.getElementById('aiStr').value) || 100) / 100;
+    AI.device = document.getElementById('aiDev').value;
+    N.storeSet({ aiDevice: AI.device });
     document.getElementById('modal').classList.remove('open');
     try {
-      if (!AI.session || AI.modelName !== key) {
+      if (!AI.session || AI.modelName !== key || AI.loadedDevice !== AI.device) {
         await busy('Loading ' + key);
         if (key === BUILTIN_DENOISE) await loadBuiltinDenoise();
         else await loadModel(key, null, m => busy(m));
@@ -382,6 +481,7 @@ async function aiModelDialog() {
 /* ---------- wiring ---------- */
 document.addEventListener('DOMContentLoaded', () => {
   if (!window.native) return;
+  N.storeGet().then(st => { if (st && ['auto', 'gpu', 'cpu'].includes(st.aiDevice)) AI.device = st.aiDevice; });
   // sit the button next to the measurement-based one in Detail
   const chips = [...document.querySelectorAll('.chip')].find(c => c.textContent === 'Auto denoise');
   if (!chips) return;

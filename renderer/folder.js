@@ -14,8 +14,41 @@ const FOLDER = { dir: null, name: '', parent: null, folders: [], files: [], cur:
 const THUMBS = new Map();         // path -> object URL of the camera's preview, shrunk
 const THUMB_EL = new Map();       // path -> strip element, so updates never rebuild the strip
 const THUMB_EDGE = 360;
+const WS = { tabs: [], active: -1 };   // workspace tabs, one folder each: { dir, name, cur }
+const RIBBON_SIDE = 7;                 // cull mode shows this many photos either side of the current one
 
 const isRawPath = n => RAWRE.test(n);
+
+/* ---------- sorting ---------- */
+const SORTS = { name: 'Name', type: 'File type' };
+let SORT = 'name';
+
+const extOf = n => { const e = (n.match(/\.([^.]+)$/) || [, ''])[1].toLowerCase(); return e === 'jpeg' ? 'jpg' : e; };
+const byName = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true });
+// raws first, then everything else, each type grouped and in name order
+const byType = (a, b) => (isRawPath(b.name) - isRawPath(a.name)) || extOf(a.name).localeCompare(extOf(b.name)) || byName(a, b);
+
+function sortFiles() {
+  FOLDER.files.sort(SORT === 'type' ? byType : byName);
+  const cur = IM();
+  FOLDER.cur = cur ? FOLDER.files.findIndex(f => f.path === cur.path) : -1;
+}
+
+function setSort(key) {
+  if (!SORTS[key]) return;
+  SORT = key;
+  N.storeSet({ sort: key });
+  syncSortSelects();
+  sortFiles();
+  renderFolder();
+}
+
+function syncSortSelects() {
+  document.querySelectorAll('.sortSel').forEach(sel => {
+    if (!sel.options.length) for (const [k, label] of Object.entries(SORTS)) sel.add(new Option(label, k));
+    sel.value = SORT;
+  });
+}
 
 /* what the filmstrip shows: everything, unless Cull mode is filtering by file type */
 function stripFiles() {
@@ -23,11 +56,23 @@ function stripFiles() {
   return FOLDER.files.filter(f => cullMatches(f.name));
 }
 
-/* ---------- opening ---------- */
-async function openFolder(dir, reopenPhoto) {
-  if (!dir) return;
+/* ---------- opening ----------
+   Opening a folder navigates the active workspace tab, unless opts.newTab asks
+   for a fresh one or the folder is already open in another tab (which then wins). */
+async function openFolder(dir, reopenPhoto, opts) {
+  opts = opts || {};
+  if (!dir) return false;
   const r = await N.scanFolder(dir);
-  if (!r || r.error) { toast(r ? r.error : 'Could not read that folder'); return; }
+  if (!r || r.error) { toast(r ? r.error : 'Could not read that folder'); return false; }
+  rememberTabPos();
+  let t = opts.tab != null ? opts.tab : WS.tabs.findIndex(x => x.dir === r.dir);
+  if (t < 0) {
+    if (opts.newTab || WS.active < 0) { WS.tabs.push({ dir: r.dir, name: r.name, cur: null }); t = WS.tabs.length - 1; }
+    else t = WS.active;
+  }
+  const tab = WS.tabs[t];
+  tab.dir = r.dir; tab.name = r.name;
+  WS.active = t;
   flushEdits();
   const paths = r.files.map(f => f.path);
   await loadRecords(paths);
@@ -39,24 +84,91 @@ async function openFolder(dir, reopenPhoto) {
 
   FOLDER.dir = r.dir; FOLDER.name = r.name; FOLDER.parent = r.parent;
   FOLDER.folders = r.folders; FOLDER.files = r.files;
-  const cur = IM();
-  FOLDER.cur = cur ? r.files.findIndex(f => f.path === cur.path) : -1;
+  sortFiles();
   exitSelectMode();
   document.getElementById('crumb').textContent = r.dir;
   document.getElementById('crumb').title = r.dir;
   N.storeSet({ lastFolder: r.dir });
   if (typeof loadPicksForFolder === 'function') loadPicksForFolder();
+  saveTabs(); renderTabs();
   renderFolder();
-  toast(`${r.files.length} photo${r.files.length === 1 ? '' : 's'} in ${r.name}`);
+  if (!opts.quiet) toast(`${r.files.length} photo${r.files.length === 1 ? '' : 's'} in ${r.name}`);
   // every thumbnail in the folder, visible ones first, so scrolling never waits
   r.files.forEach(f => requestThumb(f.path, false));
   if (reopenPhoto) {
-    const i = r.files.findIndex(f => f.path === reopenPhoto);
-    if (i >= 0 && A.cur < 0) openPhotoAt(i);
+    const i = FOLDER.files.findIndex(f => f.path === reopenPhoto);
+    // switching tabs brings that tab's photo back even with another one on screen
+    if (i >= 0 && (A.cur < 0 || opts.switching) && !(IM() && IM().path === reopenPhoto)) openPhotoAt(i);
   }
+  return true;
 }
 
 function closeFolder() {
+  if (WS.active >= 0) { closeTab(WS.active); return; }
+  clearFolder();
+}
+
+/* ---------- workspace tabs ---------- */
+function rememberTabPos() {
+  const t = WS.tabs[WS.active], f = FOLDER.files[FOLDER.cur];
+  if (t && f && t.dir === FOLDER.dir) t.cur = f.path;
+}
+
+let _tabSave = 0;
+function saveTabs() {
+  clearTimeout(_tabSave);
+  _tabSave = setTimeout(() => {
+    rememberTabPos();
+    N.storeSet({ workspaces: WS.tabs.map(t => ({ dir: t.dir, cur: t.cur || null })), activeWorkspace: WS.active });
+  }, 400);
+}
+
+function switchTab(i) {
+  if (i === WS.active || !WS.tabs[i]) return;
+  rememberTabPos();
+  openFolder(WS.tabs[i].dir, WS.tabs[i].cur, { tab: i, switching: true, quiet: true });
+}
+
+function closeTab(i) {
+  if (!WS.tabs[i]) return;
+  const wasActive = i === WS.active;
+  WS.tabs.splice(i, 1);
+  if (i < WS.active) WS.active--;
+  if (wasActive) {
+    WS.active = -1;
+    if (WS.tabs.length) {
+      const n = Math.min(i, WS.tabs.length - 1);
+      openFolder(WS.tabs[n].dir, WS.tabs[n].cur, { tab: n, switching: true, quiet: true });
+      return;
+    }
+    clearFolder();
+    N.storeSet({ lastFolder: null });
+  }
+  saveTabs(); renderTabs();
+}
+
+function renderTabs() {
+  const bar = document.getElementById('wtabs');
+  if (!bar) return;
+  bar.innerHTML = '';
+  if (!WS.tabs.length) return;
+  WS.tabs.forEach((t, i) => {
+    const d = document.createElement('div');
+    d.className = 'wtab' + (i === WS.active ? ' on' : '');
+    d.title = t.dir;
+    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = t.name;
+    const x = document.createElement('span'); x.className = 'x'; x.textContent = '×'; x.title = 'Close workspace';
+    d.append(nm, x);
+    d.onclick = e => e.target === x ? closeTab(i) : switchTab(i);
+    bar.append(d);
+  });
+  const add = document.createElement('div');
+  add.className = 'wtab add'; add.textContent = '+'; add.title = 'Open a folder in a new workspace';
+  add.onclick = async () => { const dir = await N.pickFolder(); if (dir) openFolder(dir, null, { newTab: true }); };
+  bar.append(add);
+}
+
+function clearFolder() {
   flushEdits();
   pruneEntries(new Set());
   cancelThumbs();
@@ -102,7 +214,21 @@ function renderFolder() {
   }
   const at = new Map(FOLDER.files.map((f, i) => [f.path, i]));
   const frag = document.createDocumentFragment();
-  list.forEach(f => frag.append(fileThumb(f, at.get(f.path))));
+  if (typeof CULL !== 'undefined' && CULL.on) {
+    // the ribbon: the photo on screen in the middle, seven either side, blanks past the ends
+    const cur = IM(), curPath = cur && cur.path;
+    let i = list.findIndex(f => f.path === curPath);
+    if (i < 0) i = 0;
+    for (let k = i - RIBBON_SIDE; k <= i + RIBBON_SIDE; k++) {
+      const f = list[k];
+      if (!f) { const b = document.createElement('div'); b.className = 'thumb blank'; frag.append(b); continue; }
+      frag.append(fileThumb(f, at.get(f.path)));
+      requestThumb(f.path, true);
+    }
+    _ribbonCur = curPath;
+  } else {
+    list.forEach(f => frag.append(fileThumb(f, at.get(f.path))));
+  }
   strip.append(frag);
   _stripCur = null;
   syncStrip();
@@ -162,11 +288,12 @@ function fileThumb(f, i) {
 }
 
 /* selection, edited and in-memory badges, updated in place */
-let _stripCur = null;
+let _stripCur = null, _ribbonCur = null;
 function syncStrip() {
   if (!FOLDER.dir) { renderFolder(); return; }
   const cur = IM(), curPath = cur && cur.path;
   const culling = typeof CULL !== 'undefined' && CULL.on;
+  if (culling && curPath !== _ribbonCur) { renderFolder(); return; }   // re-centre the ribbon
   for (const [p, el] of THUMB_EL) {
     const im = PHOTOS.get(p);
     el.classList.toggle('sel', p === curPath);
@@ -391,6 +518,7 @@ function openPhotoAt(i) {
   if (i < 0 || i >= FOLDER.files.length) return;
   const f = FOLDER.files[i];
   FOLDER.cur = i;
+  saveTabs();
   openPath(f.path, f.name).catch(e => toast(f.name + ': ' + e.message));
 }
 
@@ -413,8 +541,7 @@ async function refreshFolder() {
   const r = await N.scanFolder(FOLDER.dir);
   if (!r || r.error) return;
   FOLDER.folders = r.folders; FOLDER.files = r.files; FOLDER.parent = r.parent;
-  const cur = IM();
-  FOLDER.cur = cur ? r.files.findIndex(f => f.path === cur.path) : -1;
+  sortFiles();
   renderFolder();
   r.files.forEach(f => requestThumb(f.path, false));
 }
@@ -428,6 +555,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (dir) openFolder(dir);
   };
   document.getElementById('btnUp').onclick = () => FOLDER.parent && openFolder(FOLDER.parent);
+  // hand focus back to the page, or the arrow keys keep cycling the dropdown
+  document.querySelectorAll('.sortSel').forEach(sel => sel.onchange = () => { setSort(sel.value); sel.blur(); });
+  syncSortSelects();
   document.getElementById('crumb').onclick = () => FOLDER.dir && N.reveal(FOLDER.dir);
 
   N.onOpenFolder(dir => openFolder(dir));
@@ -475,5 +605,21 @@ document.addEventListener('DOMContentLoaded', () => {
   window.buildStrip = function () { if (FOLDER.dir) syncStrip(); else renderFolder(); };
 
   // pick up where you left off: the folder, and the photo that was on screen
-  N.storeGet().then(st => { if (st && st.lastFolder) openFolder(st.lastFolder, st.lastPhoto); });
+  N.storeGet().then(async st => {
+    st = st || {};
+    if (SORTS[st.sort]) SORT = st.sort;
+    syncSortSelects();
+    const saved = (st.workspaces || []).filter(t => t && t.dir);
+    if (!saved.length) { if (st.lastFolder) openFolder(st.lastFolder, st.lastPhoto); return; }
+    // reopen every workspace tab; one whose folder has gone is dropped
+    WS.tabs = saved.map(t => ({ dir: t.dir, name: baseName(t.dir), cur: t.cur || null }));
+    let a = clamp(st.activeWorkspace | 0, 0, WS.tabs.length - 1);
+    renderTabs();
+    while (WS.tabs.length) {
+      if (await openFolder(WS.tabs[a].dir, WS.tabs[a].cur || st.lastPhoto, { tab: a })) break;
+      WS.tabs.splice(a, 1);
+      a = clamp(a, 0, WS.tabs.length - 1);
+    }
+    saveTabs(); renderTabs();
+  });
 });

@@ -1,10 +1,11 @@
 /* ============================================================
    cull.js — picking the keepers out of a shoot
    ------------------------------------------------------------
-   A second mode, reached by the tab in the header. The panels get
-   out of the way, the photo fills the window and the filmstrip lies
-   along the bottom: arrow keys walk the shoot, K flags what's worth
-   editing, and Move takes the flagged files to a folder of their own.
+   A second mode, reached by the Edit | Cull toggle in the header. The
+   panels get out of the way, the photo fills the window with arrows
+   either side, and a ribbon of fifteen frames lies along the bottom:
+   arrow keys walk the shoot, K flags what's worth editing, and Move
+   takes the flagged files to a new folder, opened in its own tab.
 
    Flags live per folder and survive a restart. Nothing is copied or
    overwritten: a move is a move, it can be undone for as long as the
@@ -54,8 +55,7 @@ function savePicks() {
 /* called by folder.js whenever a folder opens */
 function loadPicksForFolder() {
   CULL.picks = new Set((CULL.stored && CULL.stored[FOLDER.dir]) || []);
-  CULL.lastMove = null;
-  cullSync();
+  cullSync();             // a move stays undoable from any tab, until the next move
 }
 
 function toggleFlag(path) {
@@ -103,14 +103,11 @@ function cullSync() {
   const inEl = document.getElementById('cullIn');
   inEl.textContent = FOLDER.dir ? baseOf(FOLDER.dir) : 'no folder open';
   inEl.title = FOLDER.dir || '';
-  const outEl = document.getElementById('cullOut');
-  outEl.textContent = CULL.out ? baseOf(CULL.out) : 'choose a folder';
-  outEl.title = CULL.out || '';
   const n = flaggedHere().length;
   document.getElementById('cullCount').textContent = n ? `${n} flagged` : 'nothing flagged';
   const mv = document.getElementById('cullMove');
-  mv.textContent = n ? `Move ${n}` : 'Move';
-  mv.disabled = !n || !CULL.out;
+  mv.textContent = n ? `Move ${n} to new workspace…` : 'Move to new workspace…';
+  mv.disabled = !n;
   document.getElementById('cullUndo').hidden = !(CULL.lastMove && CULL.lastMove.length);
   document.getElementById('cullFilter').value = CULL.filter;
   const im = IM();
@@ -118,20 +115,48 @@ function cullSync() {
 }
 
 /* ---------- moving the keepers ---------- */
-function cullConfirm(n, then) {
+function joinPath(dir, name) {
+  const sep = dir.includes('\\') && !dir.includes('/') ? '\\' : '/';
+  return dir.replace(/[\\/]+$/, '') + sep + name;
+}
+
+/* name the new folder and where it goes; the default is a "Selects" folder
+   beside the photos, or inside whichever location you picked last time */
+function cullMoveDialog(n, then) {
+  let parent = CULL.out || FOLDER.dir;
   document.getElementById('card').innerHTML =
-    `<h4>Move ${n} photo${n === 1 ? '' : 's'}</h4>
+    `<h4>Move ${n} flagged photo${n === 1 ? '' : 's'}</h4>
      <div class="cbody">
-       <div class="hint" style="color:var(--text);margin:6px 0">
-         ${n === 1 ? 'This file leaves' : 'These files leave'} <b>${esc(FOLDER.dir)}</b><br>and ${n === 1 ? 'ends' : 'end'} up in <b>${esc(CULL.out)}</b>.
-       </div>
-       <div class="hint">Nothing is overwritten — a name already in use gets a number. Edits you have made travel with the photo, and <b>Move back</b> undoes this until you move again or quit.</div>
+       <div class="field"><span>New folder</span><input type="text" id="cmName"></div>
+       <div class="field"><span>Inside</span><button class="tb" id="cmWhere"
+         style="max-width:190px;overflow:hidden;text-overflow:ellipsis"></button></div>
+       <div class="hint">${n === 1 ? 'This file leaves' : 'These files leave'} <b>${esc(baseOf(FOLDER.dir))}</b> and
+       open in a new workspace tab, ready to edit. Nothing is overwritten — a name already in use
+       gets a number. Edits and any .xmp / .slcar sidecars travel with the photo, and <b>Move back</b>
+       undoes this until you move again or quit.</div>
      </div>
-     <div class="foot"><button class="tb" id="cmCancel">Cancel</button><button class="tb primary" id="cmGo">Move ${n}</button></div>`;
+     <div class="foot"><button class="tb" id="cmCancel">Cancel</button><button class="tb primary" id="cmGo">Move &amp; open</button></div>`;
+  const where = document.getElementById('cmWhere');
+  const showWhere = () => { where.textContent = baseOf(parent); where.title = parent; };
+  showWhere();
+  const nameEl = document.getElementById('cmName');
+  nameEl.value = 'Selects';
   document.getElementById('modal').classList.add('open');
+  nameEl.focus(); nameEl.select();
   const close = () => document.getElementById('modal').classList.remove('open');
+  where.onclick = async () => {
+    const d = await N.pickCullOut();             // remembered for next time
+    if (d) { parent = CULL.out = d; showWhere(); }
+  };
+  const go = () => {
+    const name = nameEl.value.trim();
+    if (!name || name === '.' || name === '..' || /[\\/:*?"<>|]/.test(name)) { toast('Pick a folder name without / \\ : * ? " < > |'); return; }
+    close();
+    then(joinPath(parent, name));
+  };
   document.getElementById('cmCancel').onclick = close;
-  document.getElementById('cmGo').onclick = () => { close(); then(); };
+  document.getElementById('cmGo').onclick = go;
+  nameEl.onkeydown = e => { if (e.key === 'Enter') go(); };
 }
 
 async function runMove(items, what) {
@@ -167,15 +192,22 @@ async function runMove(items, what) {
 
 async function cullMoveFlagged() {
   if (!FOLDER.dir) { toast('Open a folder first'); return; }
-  if (!CULL.out) { toast('Choose an output folder first'); return; }
-  if (CULL.out === FOLDER.dir) { toast('The output folder is the folder you are culling'); return; }
   const paths = flaggedHere();
   if (!paths.length) { toast('Nothing flagged — press K on the ones worth keeping'); return; }
-  cullConfirm(paths.length, async () => {
-    const moved = await runMove(paths.map(p => ({ from: p, toDir: CULL.out })), `Moving ${paths.length} photo${paths.length === 1 ? '' : 's'}`);
+  cullMoveDialog(paths.length, async dest => {
+    if (dest === FOLDER.dir) { toast('That is the folder you are culling'); return; }
+    const moved = await runMove(paths.map(p => ({ from: p, toDir: dest })), `Moving ${paths.length} photo${paths.length === 1 ? '' : 's'}`);
     CULL.lastMove = moved.length ? moved : null;
     cullSync();
-    if (moved.length) toast(`Moved ${moved.length} photo${moved.length === 1 ? '' : 's'} to ${baseOf(CULL.out)}`);
+    if (!moved.length) return;
+    // the keepers get a workspace of their own, opened in Edit on the first of them
+    const first = moved[0].to;
+    if (await openFolder(dest, null, { newTab: true, quiet: true })) {
+      setCullMode(false);
+      const i = FOLDER.files.findIndex(f => f.path === first);
+      openPhotoAt(i >= 0 ? i : 0);
+    }
+    toast(`Moved ${moved.length} photo${moved.length === 1 ? '' : 's'} to ${baseOf(dest)}`);
   });
 }
 
@@ -201,12 +233,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const dir = await N.pickFolder();
     if (dir) openFolder(dir);
   };
-  document.getElementById('cullPickOut').onclick = async () => {
-    const dir = await N.pickCullOut();
-    if (!dir) return;
-    CULL.out = dir;
-    cullSync();
-  };
+  document.getElementById('cullPrev').onclick = () => stepPhoto(-1);
+  document.getElementById('cullNext').onclick = () => stepPhoto(1);
   document.getElementById('cullFilter').onchange = e => {
     CULL.filter = e.target.value;
     N.storeSet({ cullFilter: CULL.filter });

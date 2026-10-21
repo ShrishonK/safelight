@@ -83,14 +83,25 @@ open instantly.
   photo, each invertible, each with its own exposure, contrast, highlights, shadows,
   saturation, temperature, tint and texture.
 
-**Cull** — the tab in the header swaps the editor for a viewer: panels out of the way, the photo
-filling the window, the filmstrip along the bottom. Arrow keys walk the shoot, `K` flags what is
-worth editing, and a dropdown in the corner narrows the strip to one kind of file (raw only, say,
-when a card holds raw and JPEG of every frame). Flagged photos **move** — not copy — to the output
-folder you choose; nothing is overwritten, a name already in use gets a number, moving across
-drives copies before it deletes, and **Move back** undoes the last move while the app is open.
-Flags belong to the folder and survive a restart. A photo's edits follow it to its new folder.
-While culling, the full-resolution decode waits until you zoom in, so stepping through stays quick.
+**Cull** — the **Edit | Cull** toggle in the header swaps the editor for a viewer: panels out of
+the way, the photo filling the window with arrows either side, and a ribbon along the bottom
+showing the seven frames before and after it. Arrow keys (or the side arrows, or a click in the
+ribbon) walk the shoot, and `K` flags what is worth editing — a flagged frame carries a
+translucent green bar across the bottom of its preview. A dropdown narrows the shoot to one kind
+of file (raw only, say, when a card holds raw and JPEG of every frame). **Move to new workspace…**
+moves — not copies — the flagged photos into a new folder (a "Selects" folder beside them unless
+you pick elsewhere) and opens it in its own tab, back in Edit. Nothing is overwritten, a name
+already in use gets a number, moving across drives copies before it deletes, `.xmp` / `.slcar`
+sidecars and your edits go with each photo, and **Move back** undoes the last move while the app
+is open. Flags belong to the folder and survive a restart. While culling, the full-resolution
+decode waits until you zoom in, so stepping through stays quick.
+
+**Workspaces** — each tab above the panels is a folder. `+` opens another; tabs, and the photo you
+were on in each, come back after a restart. Both modes can sort a folder by name or by file type.
+
+**Neural denoise** — runs on the GPU through WebGPU where it can, otherwise on several CPU
+threads; the Device setting in its dialog forces one or the other, and the finished message says
+which ran. An fp16 export of a model runs about twice as fast on a GPU.
 
 **Getting through a shoot** — filmstrip on the left, arrow keys to move, `⌥⌘C` / `⌥⌘V` to copy
 settings between frames, `⇧1`–`⇧9` to save a look and `1`–`9` to apply it. Presets survive
@@ -101,7 +112,7 @@ restarts. Export one photo with a save dialog, or the whole roll into a folder.
 | | |
 |---|---|
 | `⌘O` | open photos |
-| `⇧⌘K` | Develop / Cull |
+| `⇧⌘K` | Edit / Cull |
 | `K` | flag this photo (in Cull) |
 | `\` (hold) | show the original |
 | `⌘B` | toggle original |
@@ -140,7 +151,7 @@ renderer/native.js   desktop layer: native dialogs, menus, preferences, export
 renderer/loader.js   photos in memory: preview → half → full, worker pool, memory budget, edits
 renderer/rawworker.js  raw decoding off the interface thread
 renderer/folder.js   folder browser, filmstrip, thumbnails
-renderer/cull.js     Cull mode: flags, file-type filter, moving the keepers
+renderer/cull.js     Cull mode: flags, file-type filter, moving the keepers to a new workspace
 renderer/vendor/     dcraw compiled to JavaScript (patched; see the note at the top of dcraw.js)
 tools/rawprep.py     fallback converter if a camera the bundled decoder doesn't know shows up
 build/               icon and macOS entitlements

@@ -1,3 +1,9 @@
 node_modules/
 dist/
 .DS_Store
+
+# local agent tooling
+.claude-flow/
+.swarm/
+.mcp.json
+ruvector.db

@@ -115,7 +115,7 @@ window.loadFiles = async function (files) {
       const parts = [];
       for (const f of modelFiles) parts.push({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) });
       const r = await installModelFiles(parts);
-      toast(`Model ready: ${r.name} · ${r.mb} MB · ${AI.backend}`);
+      toast(`Model ready: ${r.name} · ${r.mb} MB · ${AI.label}`);
     } catch (e) {
       failed.push('model — ' + e.message);
     } finally { busy(null); }
@@ -352,7 +352,8 @@ function helpCard(info) {
     ['\\', 'hold to see the original'], ['Z', 'fit / 100%'], ['C', 'crop tool'],
     ['G / M / B', 'add linear, radial, brush mask'], ['L / K', 'add luminance, colour mask'],
     ['O', 'toggle mask overlay'], ['[ ]', 'brush size'], ['1–9', 'apply preset'],
-    ['⇧1–9', 'save preset'], ['← →', 'previous / next photo'], ['drag a slider label', 'fine scrub, hold ⇧ for finer']
+    ['⇧1–9', 'save preset'], ['← →', 'previous / next photo'], ['drag a slider label', 'fine scrub, hold ⇧ for finer'],
+    ['⇧Ctrl K', 'Edit / Cull'], ['K (in Cull)', 'flag / unflag'], ['Esc (in Cull)', 'back to Edit']
   ];
   document.getElementById('card').innerHTML = `<h4>Shortcuts</h4><div class="cbody">${rows.map(([k, v]) =>
     `<div class="field"><span>${v}</span><b style="font:400 11px var(--mono);color:var(--amber)">${k}</b></div>`).join('')}

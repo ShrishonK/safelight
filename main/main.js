@@ -18,6 +18,13 @@ const isPhoto = p => PHOTO_EXT.has(path.extname(p).slice(1).toLowerCase());
 let win = null;
 let queued = [];          // files handed to us before the window is ready
 
+// Neural denoise runs ONNX Runtime in WebAssembly. Its worker threads need
+// SharedArrayBuffer, which Chromium withholds from file:// pages unless asked;
+// without it every CPU inference runs on a single core.
+app.commandLine.appendSwitch('enable-features', 'SharedArrayBuffer');
+// WebGPU is still behind a flag on Linux builds of Chromium.
+if (process.platform === 'linux') app.commandLine.appendSwitch('enable-unsafe-webgpu');
+
 /* ---------- tiny persistent store ---------- */
 function readStore() {
   try { return JSON.parse(fs.readFileSync(STORE, 'utf8')); } catch { return {}; }
@@ -303,12 +310,31 @@ function moveTrouble(e) {
   return by || e.message;
 }
 
+/* sidecars written by Lightroom/Capture One (.xmp) and by us (.slcar) travel with their photo,
+   renamed to match if the photo had to take a numbered name */
+async function moveSidecars(from, to) {
+  const ext = path.extname(from), base = from.slice(0, from.length - ext.length);
+  const toExt = path.extname(to), toBase = to.slice(0, to.length - toExt.length);
+  const seen = new Set();
+  for (const [stem, target] of [[base, toBase], [from, to]]) {
+    for (const sx of ['.xmp', '.XMP', '.slcar']) {
+      const sp = stem + sx;
+      if (seen.has(sp.toLowerCase())) continue;
+      seen.add(sp.toLowerCase());
+      try { await fs.promises.access(sp); } catch { continue; }
+      try { await moveOne(sp, path.dirname(to), path.basename(target + sx)); }
+      catch (e) { console.warn('sidecar move failed', sp, e.message); }
+    }
+  }
+}
+
 ipcMain.handle('cull:move', async (_e, items) => {
   const out = [];
   for (const it of items) {
     try {
       const to = await moveOne(it.from, it.toDir, it.toName);
       moveEditRecord(it.from, to);
+      await moveSidecars(it.from, to);
       out.push({ from: it.from, to });
     } catch (e) {
       out.push({ from: it.from, error: moveTrouble(e) });

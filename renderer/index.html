@@ -43,7 +43,101 @@
       overflow: hidden;
       -webkit-font-smoothing: antialiased;
       display: grid;
-      grid-template-rows: 40px auto 1fr auto;
+      grid-template-rows: 40px auto auto minmax(0, 1fr) auto;
+    }
+
+    /* explicit rows: the bars come and go, and must not shuffle main out of the 1fr row */
+    header { grid-row: 1 }
+    #wtabs { grid-row: 2 }
+    #cullbar { grid-row: 3 }
+    main { grid-row: 4 }
+    #cullstrip { grid-row: 5 }
+
+    /* ---------- workspace tabs ---------- */
+    #wtabs {
+      display: flex;
+      align-items: flex-end;
+      gap: 2px;
+      height: 30px;
+      padding: 0 8px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      overflow-x: auto;
+      overflow-y: hidden
+    }
+
+    #wtabs:empty {
+      display: none
+    }
+
+    .wtab {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      max-width: 240px;
+      padding: 5px 7px 6px 11px;
+      font: 400 11px/1.2 var(--mono);
+      color: var(--dim);
+      border: 1px solid transparent;
+      border-bottom: 0;
+      border-radius: var(--r) var(--r) 0 0;
+      cursor: pointer;
+      white-space: nowrap
+    }
+
+    .wtab:hover {
+      color: var(--text)
+    }
+
+    .wtab.on {
+      background: var(--bg);
+      color: var(--text);
+      border-color: var(--line);
+      box-shadow: inset 0 2px 0 var(--amber)
+    }
+
+    .wtab .nm {
+      overflow: hidden;
+      text-overflow: ellipsis
+    }
+
+    .wtab .x {
+      color: var(--faint);
+      font-size: 13px;
+      line-height: 1;
+      padding: 0 2px
+    }
+
+    .wtab .x:hover {
+      color: var(--clip)
+    }
+
+    .wtab.add {
+      padding: 4px 9px 6px;
+      font-size: 14px
+    }
+
+    #fbar { grid-row: 1 }
+    #sortbar { grid-row: 2 }
+    #selbar { grid-row: 3 }
+    #tree { grid-row: 4 }
+    #side > #strip { grid-row: 5 }
+
+    /* ---------- sort ---------- */
+    #sortbar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 6px;
+      border-bottom: 1px solid var(--line);
+      font-size: 11px;
+      color: var(--dim)
+    }
+
+    #sortbar select,
+    #cullbar select {
+      min-width: 0;
+      padding: 3px 4px
     }
 
     button,
@@ -222,8 +316,7 @@
     }
 
     body.cull #cullstrip {
-      display: block;
-      height: 150px
+      display: block
     }
 
     body.cull #side,
@@ -236,41 +329,74 @@
     }
 
     /* the same filmstrip element, laid out along the bottom while culling */
+    /* the ribbon: fifteen frames, the one on screen in the middle */
     body.cull #strip {
-      display: flex;
-      flex-direction: row;
+      display: grid;
+      grid-template-columns: repeat(15, minmax(0, 1fr));
       align-items: center;
       height: 100%;
-      overflow-x: auto;
-      overflow-y: hidden;
-      gap: 8px;
+      overflow: hidden;
+      gap: 6px;
       padding: 10px
     }
 
     body.cull #strip .thumb {
-      width: 172px;
-      flex: 0 0 auto
+      content-visibility: visible
     }
 
+    body.cull #strip .thumb.blank {
+      visibility: hidden
+    }
+
+    /* flagged: a translucent bar along the bottom of the preview */
     .thumb .flag {
       display: none;
       position: absolute;
-      left: 4px;
-      bottom: 16px;
-      width: 13px;
-      height: 13px;
-      border-radius: 3px;
-      background: var(--keep);
-      box-shadow: 0 0 0 1px rgba(0, 0, 0, .55)
+      left: 0;
+      right: 0;
+      bottom: 13.5px;             /* sits on the file name, not under it */
+      height: 24%;
+      background: rgba(86, 194, 113, .45);
+      border-top: 1px solid var(--keep);
+      pointer-events: none
     }
 
     .thumb.is-flagged .flag {
       display: block
     }
 
-    .thumb.is-flagged {
-      outline: 2px solid var(--keep);
-      outline-offset: -2px
+    /* previous / next, either side of the photo */
+    .cnav {
+      display: none;
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      z-index: 3;
+      width: 52px;
+      height: 120px;
+      border: 0;
+      border-radius: var(--r);
+      background: rgba(10, 14, 18, .35);
+      color: var(--dim);
+      font: 300 46px/1 var(--ui);
+      cursor: pointer
+    }
+
+    body.cull .cnav {
+      display: block
+    }
+
+    .cnav:hover {
+      color: var(--amber);
+      background: rgba(10, 14, 18, .6)
+    }
+
+    #cullPrev {
+      left: 10px
+    }
+
+    #cullNext {
+      right: 10px
     }
 
     #flagbadge {
@@ -317,7 +443,7 @@
       background: var(--panel);
       border-right: 1px solid var(--line);
       display: grid;
-      grid-template-rows: auto auto auto 1fr;
+      grid-template-rows: auto auto auto auto minmax(0, 1fr);
       grid-template-columns: minmax(0, 1fr);
       min-height: 0;
       min-width: 0;
@@ -1189,7 +1315,7 @@
   <header>
     <div class="mark">Safelight<span>/dev</span></div>
     <div class="tabs">
-      <button class="tab on" id="tabDevelop" title="Develop">Develop</button>
+      <button class="tab on" id="tabDevelop" title="Edit">Edit</button>
       <button class="tab" id="tabCull" title="Cull (Ctrl+Shift+K)">Cull</button>
     </div>
     <button class="tb" id="btnOpen">Open photos</button>
@@ -1208,18 +1334,18 @@
     <button class="tb" id="btnExport">Export…</button>
     <button class="tb primary" id="btnExportAll">Export all</button>
   </header>
+  <nav id="wtabs"></nav>
 
   <div id="cullbar" hidden>
     <span class="clabel">In</span>
     <span class="cpath" id="cullIn">no folder open</span>
     <button class="tb" id="cullPickIn">Folder…</button>
-    <span class="clabel">Keep in</span>
-    <span class="cpath" id="cullOut">choose a folder</span>
-    <button class="tb" id="cullPickOut">Output folder…</button>
+    <span class="clabel">Sort</span>
+    <select class="sortSel" title="Sort the folder"></select>
     <div class="spacer"></div>
     <span class="stat" id="cullCount">nothing flagged</span>
     <button class="tb" id="cullUndo" hidden>Move back</button>
-    <button class="tb primary" id="cullMove">Move</button>
+    <button class="tb primary" id="cullMove">Move to new workspace…</button>
     <select id="cullFilter" title="Which files to show">
       <option value="all">All files</option>
       <option value="raw">Raw only</option>
@@ -1235,6 +1361,10 @@
         <button class="tb" id="btnFolder" title="Open a folder (Ctrl+Shift+O)">Folder…</button>
         <button class="tb" id="btnUp" title="Go up a folder">↑</button>
         <div id="crumb">no folder open</div>
+      </div>
+      <div id="sortbar">
+        <span>Sort</span>
+        <select class="sortSel" title="Sort the folder"></select>
       </div>
       <div id="selbar" hidden>
         <span id="selCount" class="stat"></span>
@@ -1257,6 +1387,8 @@
       <div id="loadpill" hidden><i></i><span></span></div>
       <div id="badge" hidden></div>
       <div id="flagbadge" hidden>KEEP</div>
+      <button class="cnav" id="cullPrev" title="Previous (←)">‹</button>
+      <button class="cnav" id="cullNext" title="Next (→)">›</button>
       <div id="drop">
         <div>
           <b>Drop photos here</b>
