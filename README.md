@@ -83,6 +83,12 @@ open instantly.
   photo, each invertible, each with its own exposure, contrast, highlights, shadows,
   saturation, temperature, tint and texture.
 
+**Red eye** — press `E` (or **Fix red eye** in the Red eye panel) and click each red pupil. The
+circle finds the pupil, centres itself on it and sizes itself to fit; drag while placing to size
+it by hand, drag a circle to move it, Alt-click to remove it. Only strongly red pixels change, so
+the catchlight, iris and eyelid are left alone, and **Pupil darkness** sets how deep the fixed
+pupil goes. Like a crop, red-eye fixes stay with their photo: copy/paste and presets skip them.
+
 **Cull** — the **Edit | Cull** toggle in the header swaps the editor for a viewer: panels out of
 the way, the photo filling the window with arrows either side, and a ribbon along the bottom
 showing the seven frames before and after it. Arrow keys (or the side arrows, or a click in the
@@ -113,6 +119,7 @@ restarts. Export one photo with a save dialog, or the whole roll into a folder.
 |---|---|
 | `⌘O` | open photos |
 | `⇧⌘K` | Edit / Cull |
+| `E` | red-eye tool on / off |
 | `K` | flag this photo (in Cull) |
 | `\` (hold) | show the original |
 | `⌘B` | toggle original |

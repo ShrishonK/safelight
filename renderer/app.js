@@ -8,7 +8,7 @@ const $ = (s, r) => (r || document).querySelector(s);
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 const lerp = (a, b, t) => a + (b - a) * t;
 const HSL_BANDS = ['Red', 'Orange', 'Yellow', 'Green', 'Aqua', 'Blue', 'Purple', 'Magenta'];
-const MAXM = 6, MAXBRUSH = 4;
+const MAXM = 6, MAXBRUSH = 4, MAXRE = 8;
 
 function idc() { return Math.random().toString(36).slice(2, 9); }
 
@@ -34,7 +34,9 @@ function defaults() {
     // effects
     vignette: 0, vigFeather: 50, vigRound: 0, grain: 0, grainSize: 25,
     // masks
-    masks: []
+    masks: [],
+    // red eye: spots in image coordinates, r a fraction of the frame height
+    redeye: [], redeyeDark: 50
   };
 }
 
@@ -58,7 +60,7 @@ const MASKLABEL = { linear: 'Linear', radial: 'Radial', brush: 'Brush', lum: 'Lu
 /* ---------------- global state ---------------- */
 const A = {
   imgs: [], cur: -1, dummy: defaults(),
-  selMask: -1, curveCh: 'rgb', before: false, cropMode: false,
+  selMask: -1, curveCh: 'rgb', before: false, cropMode: false, redeyeMode: false,
   view: { zoom: 0, ox: 0, oy: 0, fit: true },
   clipboard: null, presets: {}, hist: null, painting: false,
   drag: null
@@ -615,6 +617,8 @@ uniform float uHslH[8], uHslS[8], uHslL[8], uHslC[8];
 uniform int uMCount, uShowMask;
 uniform float uMType[MAXM];
 uniform vec4 uMGeoA[MAXM], uMGeoB[MAXM], uMAdjA[MAXM], uMAdjB[MAXM], uMAdjC[MAXM], uMFlags[MAXM];
+#define MAXRE 8
+uniform vec4 uRE[MAXRE]; uniform int uRECount; uniform float uREDark;
 in vec2 v; out vec4 o;
 
 float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
@@ -726,6 +730,24 @@ void main(){
   vec3 sm = c*0.36;
   sm += (texture(uBase,v+vec2(uTexel.x,0.)*uSharpR).rgb + texture(uBase,v-vec2(uTexel.x,0.)*uSharpR).rgb)*0.16;
   sm += (texture(uBase,v+vec2(0.,uTexel.y)*uSharpR).rgb + texture(uBase,v-vec2(0.,uTexel.y)*uSharpR).rgb)*0.16;
+
+  // --- red eye ---
+  // Only pixels that are strongly red inside a spot change, so an oversized circle
+  // still leaves the iris, the eyelid and the white catchlight alone. Redness is
+  // judged on display values: in linear light ordinary skin reads as nearly as red.
+  // Skin, brown irises and pink eyelids score 0.2-0.45; a red pupil 0.6-0.9.
+  for(int i=0;i<MAXRE;i++){
+    if(i>=uRECount) break;
+    vec4 e = uRE[i];
+    vec2 p = iuv-e.xy; p.x *= uAspect;
+    float sw = 1.-smoothstep(0.85,1.,length(p)/max(e.z,1e-5));
+    if(sw<=0.) continue;
+    vec3 dsp = l2s(max(c,0.));
+    float red = (dsp.r-max(dsp.g,dsp.b))/max(dsp.r,1e-3);
+    float rw = smoothstep(0.37,0.55,red)*smoothstep(0.06,0.16,dsp.r);
+    float n = 0.5*(c.g+c.b);
+    c = mix(c, vec3(n)*mix(1.,0.25,uREDark), sw*rw);
+  }
 
   // --- masks (local adjustments, linear light) ---
   for(int i=0;i<MAXM;i++){
@@ -1083,6 +1105,10 @@ function develop(im, vw, vh, VS_, VO_, forExport) {
   gl.uniform1fv(u.uMType, ty); gl.uniform4fv(u.uMGeoA, ga); gl.uniform4fv(u.uMGeoB, gb);
   gl.uniform4fv(u.uMAdjA, aa); gl.uniform4fv(u.uMAdjB, ab);
   gl.uniform4fv(u.uMAdjC, ac); gl.uniform4fv(u.uMFlags, fl);
+  const re = (s.redeye || []).slice(0, MAXRE), rv = new Float32Array(MAXRE * 4);
+  re.forEach((e, i) => rv.set([e.x, e.y, e.r, 0], i * 4));
+  gl.uniform4fv(u.uRE, rv); gl.uniform1i(u.uRECount, re.length);
+  gl.uniform1f(u.uREDark, (s.redeyeDark === undefined ? 50 : s.redeyeDark) / 100);
   const showing = (!forExport && A.selMask >= 0 && A.showMask && A.selMask < n) ? A.selMask : -1;
   gl.uniform1i(u.uShowMask, showing);
   draw();
@@ -1226,6 +1252,18 @@ function buildPanels() {
     b.insertAdjacentHTML('beforeend', '<div class="divline"></div>');
     sl(b, 'grain', 'Grain', 0, 1, .01, 0);
     sl(b, 'grainSize', 'Grain size', 0, 100, 1, 25, 'int');
+  });
+
+  mkSection(P, 'Red eye', false, b => {
+    const g = document.createElement('div'); g.className = 'grp'; b.append(g);
+    const btn = document.createElement('div'); btn.className = 'chip'; btn.id = 'redeyeBtn';
+    btn.textContent = 'Fix red eye (E)'; btn.onclick = () => toggleRedeye(); g.append(btn);
+    const clr = document.createElement('div'); clr.className = 'chip';
+    clr.textContent = 'Clear'; clr.onclick = clearRedeye; g.append(clr);
+    sl(b, 'redeyeDark', 'Pupil darkness', 0, 100, 1, 50, 'int');
+    const info = document.createElement('div'); info.className = 'hint'; info.id = 'redeyeInfo'; b.append(info);
+    b.insertAdjacentHTML('beforeend', '<div class="hint">Turn the tool on, then click each red pupil. Drag while placing to size the circle, drag a circle to move it, Alt-click to remove. Only red pixels change, so the catchlight stays.</div>');
+    ctrls.push({ grp: 'main', sync: syncRedeye });
   });
 
   mkSection(P, 'Masks', true, (b, sect, h) => {
@@ -1640,6 +1678,16 @@ function drawOverlay() {
     [[p0[0], p0[1]], [p1[0], p0[1]], [p0[0], p1[1]], [p1[0], p1[1]]].forEach(p => dot(p[0], p[1], true));
     return;
   }
+  if (A.redeyeMode) {
+    const hpx = V.cssH / V.VS[1];                     // screen pixels per frame height
+    for (const e of im.s.redeye || []) {
+      const c = img2screen(V, e.x, e.y);
+      g.beginPath(); g.arc(c[0], c[1], e.r * hpx, 0, 6.2832);
+      g.strokeStyle = 'rgba(10,14,18,.7)'; g.lineWidth = 3; g.stroke();
+      g.strokeStyle = '#e9a23b'; g.lineWidth = 1.4; g.stroke();
+    }
+    return;
+  }
   const m = im.s.masks[A.selMask]; if (!m || !A.showMask) return;
   g.strokeStyle = '#e9a23b'; g.lineWidth = 1.4;
   if (m.type === 'linear') {
@@ -1687,6 +1735,7 @@ function wireStage() {
     const im = IM(), s = im.s;
 
     if (A.cropMode) { startCropDrag(e, V, iuv); return; }
+    if (A.redeyeMode && !e.shiftKey) { redeyeDown(e, V, iuv); return; }
     const m = s.masks[A.selMask];
     if (m && m.type === 'brush' && !e.shiftKey && e.button === 0) {
       A.painting = true; paintAt(m, iuv, e.altKey); uploadBrush(m.brush); requestRender(false);
@@ -1717,6 +1766,7 @@ function wireStage() {
     }
     if (d.kind === 'paint') { paintAt(d.m, iuv, d.erase); uploadBrush(d.m.brush); requestRender(false); return; }
     if (d.kind === 'crop') { moveCropDrag(d, iuv); return; }
+    if (d.kind === 'reNew' || d.kind === 'reMove') { redeyeMove(d, V, iuv, e); return; }
     const g = d.m.geo;
     if (d.kind === 'lin0') { g.x0 = iuv[0]; g.y0 = iuv[1]; }
     if (d.kind === 'lin1') { g.x1 = iuv[0]; g.y1 = iuv[1]; }
@@ -1731,6 +1781,13 @@ function wireStage() {
   });
 
   const end = () => {
+    const d = A.drag;
+    if (d && d.kind === 'reNew' && !d.found && !d.sizing) {
+      const list = S().redeye, i = list.indexOf(d.sp);
+      if (i >= 0) list.splice(i, 1);
+      syncRedeye();
+      toast('No red pupil found there — drag to draw the circle yourself');
+    }
     if (A.drag) { A.drag = null; A.painting = false; requestRender(true); }
   };
   stage.addEventListener('pointerup', end);
@@ -1738,11 +1795,126 @@ function wireStage() {
   stage.addEventListener('contextmenu', e => e.preventDefault());
 }
 
+/* ---------------- red eye ----------------
+   Click a pupil to fix it, drag while placing to size the circle, drag an
+   existing circle to move it, Alt- or right-click one to remove it. */
+function toggleRedeye(on) {
+  if (A.cur < 0) { toast('Open a photo first'); return; }
+  if (typeof CULL !== 'undefined' && CULL.on) return;      // a viewing mode: nothing to edit
+  A.redeyeMode = on === undefined ? !A.redeyeMode : on;
+  if (A.redeyeMode && A.cropMode) toggleCrop();
+  const b = $('#redeyeBtn'); if (b) b.classList.toggle('on', A.redeyeMode);
+  if (A.redeyeMode) toast('Click each red pupil · drag to size · Alt-click to remove');
+  drawOverlay();
+}
+
+function redeyeHit(V, iuv) {
+  const s = S(), list = s.redeye || [], hpx = V.cssH / V.VS[1];
+  const p = img2screen(V, iuv[0], iuv[1]);
+  for (let i = list.length - 1; i >= 0; i--) {
+    const c = img2screen(V, list[i].x, list[i].y);
+    if (Math.hypot(p[0] - c[0], p[1] - c[1]) <= Math.max(list[i].r * hpx, 8)) return i;
+  }
+  return -1;
+}
+
+function redeyeDown(e, V, iuv) {
+  const s = S();
+  if (!s.redeye) s.redeye = [];
+  const hit = redeyeHit(V, iuv);
+  if (hit >= 0 && (e.altKey || e.button === 2)) {
+    s.redeye.splice(hit, 1); syncRedeye(); requestRender(true); return;
+  }
+  if (e.button !== 0) return;
+  if (hit >= 0) { const sp = s.redeye[hit]; A.drag = { kind: 'reMove', sp, o: [...iuv], g: { x: sp.x, y: sp.y } }; return; }
+  if (s.redeye.length >= MAXRE) { toast(`${MAXRE} red-eye spots max — remove one first`); return; }
+  // the circle finds the pupil itself; dragging while placing overrides its size
+  const found = redeyeFind(V, iuv);
+  const sp = found || { x: iuv[0], y: iuv[1], r: 2 / V.G.outH };
+  s.redeye.push(sp);
+  // with nothing found, only a drag places a circle — a stray click must not darken lips
+  A.drag = { kind: 'reNew', sp, sx: e.clientX, sy: e.clientY, found: !!found };
+  syncRedeye(); requestRender(false);
+}
+
+/* Render a small patch around the click without any red-eye fix, grow the red
+   region the click landed in, and fit a circle to it. Returns null when there is
+   no compact red blob there (a click on skin, or on a red shirt). */
+function redeyeFind(V, iuv) {
+  const im = IM(), G = V.G, N_ = 96;
+  const P = Math.max(24, 4 * 14 * G.outH / (V.cssH / V.VS[1]));   // patch side in image pixels
+  const saved = im.s, px = new Uint8Array(N_ * N_ * 4);
+  try {
+    im.s = Object.assign({}, saved, { redeye: [] });
+    const R = develop(im, N_, N_, [P / G.outW, P / G.outH], [iuv[0], iuv[1]], true);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, R.out.fb);
+    gl.readPixels(0, 0, N_, N_, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  } finally { im.s = saved; freeExport(); requestRender(false); }
+
+  const red = new Uint8Array(N_ * N_);
+  for (let i = 0; i < N_ * N_; i++) {
+    const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
+    red[i] = r >= 40 && (r - Math.max(g, b)) / r > 0.5 ? 1 : 0;    // same scale as the shader
+  }
+  // start from the red pixel nearest the click (it may have landed on the catchlight)
+  const c = N_ >> 1;
+  let seed = -1, best = Infinity;
+  for (let y = c - 12; y <= c + 12; y++) for (let x = c - 12; x <= c + 12; x++) {
+    const d = (x - c) ** 2 + (y - c) ** 2;
+    if (red[y * N_ + x] && d < best) { best = d; seed = y * N_ + x; }
+  }
+  if (seed < 0) return null;
+  const seen = new Uint8Array(N_ * N_), stack = [seed], pts = [];
+  seen[seed] = 1;
+  while (stack.length) {
+    const i = stack.pop(), x = i % N_, y = (i / N_) | 0;
+    if (x === 0 || y === 0 || x === N_ - 1 || y === N_ - 1) return null;   // ran off the patch: not a pupil
+    pts.push(x, y);
+    for (const j of [i - 1, i + 1, i - N_, i + N_]) if (red[j] && !seen[j]) { seen[j] = 1; stack.push(j); }
+  }
+  let sx = 0, sy = 0;
+  for (let k = 0; k < pts.length; k += 2) { sx += pts[k]; sy += pts[k + 1]; }
+  const n = pts.length / 2, mx = sx / n, my = sy / n;
+  let rmax = 0;
+  for (let k = 0; k < pts.length; k += 2) rmax = Math.max(rmax, Math.hypot(pts[k] - mx, pts[k + 1] - my));
+  const k = P / N_;                                    // patch pixels -> image pixels
+  return {
+    x: iuv[0] + (mx + .5 - c) * k / G.outW,
+    y: iuv[1] + (my + .5 - c) * k / G.outH,
+    r: (rmax + 1.5) * 1.15 * k / G.outH                // a little past the edge, so the rim goes too
+  };
+}
+
+function redeyeMove(d, V, iuv, ev) {
+  const sp = d.sp;
+  if (d.kind === 'reMove') { sp.x = d.g.x + iuv[0] - d.o[0]; sp.y = d.g.y + iuv[1] - d.o[1]; }
+  else {
+    // a real drag sizes the circle by hand; a twitch of the hand does not
+    if (Math.hypot(ev.clientX - d.sx, ev.clientY - d.sy) < 5 && !d.sizing) return;
+    d.sizing = true;
+    const asp = V.G.outW / V.G.outH;
+    sp.r = Math.max(2 / V.G.outH, Math.hypot((iuv[0] - sp.x) * asp, iuv[1] - sp.y));
+  }
+  requestRender(false);
+}
+
+function clearRedeye() {
+  const s = S(); if (!s.redeye || !s.redeye.length) return;
+  s.redeye = []; syncRedeye(); requestRender(true);
+}
+
+function syncRedeye() {
+  const n = (S().redeye || []).length;
+  const el = $('#redeyeInfo');
+  if (el) el.textContent = n ? `${n} eye${n === 1 ? '' : 's'} fixed` : 'No eyes fixed yet.';
+}
+
 /* ---------------- crop ---------------- */
 function toggleCrop() {
   if (A.cur < 0) return;
   A.cropMode = !A.cropMode;
   $('#cropBtn').classList.toggle('on', A.cropMode);
+  if (A.cropMode && A.redeyeMode) toggleRedeye(false);
   if (A.cropMode) { A.cropDraft = { ...S().crop }; A.view.fit = true; }
   else { S().crop = A.cropDraft || S().crop; A.cropDraft = null; A.view.fit = true; }
   requestRender(true);
@@ -1906,7 +2078,8 @@ function thumbFromHalf(data, w, h) {
 
 function selectImage(i) {
   if (i < 0 || i >= A.imgs.length) return;
-  A.cur = i; A.selMask = -1; A.showMask = false; A.cropMode = false; A.cropDraft = null;
+  A.cur = i; A.selMask = -1; A.showMask = false; A.cropMode = false; A.cropDraft = null; A.redeyeMode = false;
+  const rb = $('#redeyeBtn'); if (rb) rb.classList.remove('on');
   const cb = $('#cropBtn'); if (cb) cb.classList.remove('on');
   A.view = { zoom: 0, ox: .5, oy: .5, fit: true };
   uploadAllBrushes();
@@ -2059,12 +2232,12 @@ function exportDialog(all) {
 function copySettings() {
   if (A.cur < 0) return;
   const s = JSON.parse(snapshot());
-  delete s.crop; delete s.rot90; delete s.flipH; delete s.flipV; delete s.straighten;
+  delete s.crop; delete s.rot90; delete s.flipH; delete s.flipV; delete s.straighten; delete s.redeye;
   A.clipboard = s; toast('Settings copied');
 }
 function pasteSettings() {
   if (A.cur < 0 || !A.clipboard) { toast('Nothing to paste'); return; }
-  const im = IM(), keep = { crop: im.s.crop, rot90: im.s.rot90, flipH: im.s.flipH, flipV: im.s.flipV, straighten: im.s.straighten };
+  const im = IM(), keep = { crop: im.s.crop, rot90: im.s.rot90, flipH: im.s.flipH, flipV: im.s.flipV, straighten: im.s.straighten, redeye: im.s.redeye || [] };
   im.s = Object.assign(defaults(), JSON.parse(JSON.stringify(A.clipboard)), keep);
   // brush masks cannot carry paint across photos
   im.s.masks = im.s.masks.filter(m => m.type !== 'brush');
@@ -2095,6 +2268,8 @@ function wireKeys() {
     const k = e.key.toLowerCase();
     if (k === 'z') { A.view.fit = !A.view.fit; if (!A.view.fit) A.view.zoom = 1; requestRender(false); }
     if (k === 'c') toggleCrop();
+    if (k === 'e') toggleRedeye();
+    if (e.key === 'Escape' && A.redeyeMode) toggleRedeye(false);
     if (k === 'm') addMask('radial');
     if (k === 'g') addMask('linear');
     if (k === 'b') addMask('brush');
@@ -2112,11 +2287,11 @@ function wireKeys() {
       const slot = e.key;
       if (e.shiftKey) {
         const s = JSON.parse(snapshot());
-        delete s.crop; delete s.rot90; delete s.flipH; delete s.flipV; delete s.straighten;
+        delete s.crop; delete s.rot90; delete s.flipH; delete s.flipV; delete s.straighten; delete s.redeye;
         s.masks = s.masks.filter(m => m.type !== 'brush');
         A.presets[slot] = s; toast('Preset ' + slot + ' saved');
       } else if (A.presets[slot] && A.cur >= 0) {
-        const im = IM(), keep = { crop: im.s.crop, rot90: im.s.rot90, flipH: im.s.flipH, flipV: im.s.flipV, straighten: im.s.straighten };
+        const im = IM(), keep = { crop: im.s.crop, rot90: im.s.rot90, flipH: im.s.flipH, flipV: im.s.flipV, straighten: im.s.straighten, redeye: im.s.redeye || [] };
         im.s = Object.assign(defaults(), JSON.parse(JSON.stringify(A.presets[slot])), keep);
         A.selMask = im.s.masks.length ? 0 : -1;
         syncAll(); rebuildMasks(); requestRender(true); toast('Preset ' + slot);

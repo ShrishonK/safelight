@@ -349,7 +349,7 @@ async function loadSidecar() {
 /* ---------- help ---------- */
 function helpCard(info) {
   const rows = [
-    ['\\', 'hold to see the original'], ['Z', 'fit / 100%'], ['C', 'crop tool'],
+    ['\\', 'hold to see the original'], ['Z', 'fit / 100%'], ['C', 'crop tool'], ['E', 'red-eye tool'],
     ['G / M / B', 'add linear, radial, brush mask'], ['L / K', 'add luminance, colour mask'],
     ['O', 'toggle mask overlay'], ['[ ]', 'brush size'], ['1–9', 'apply preset'],
     ['⇧1–9', 'save preset'], ['← →', 'previous / next photo'], ['drag a slider label', 'fine scrub, hold ⇧ for finer'],
@@ -402,7 +402,7 @@ const BUILTIN_PRESETS = [{
   }
 }];
 
-const GEOM_KEYS = ['crop', 'cropAspect', 'rot90', 'flipH', 'flipV', 'straighten'];
+const GEOM_KEYS = ['crop', 'cropAspect', 'rot90', 'flipH', 'flipV', 'straighten', 'redeye'];   // tied to this frame
 
 function presetLib() {
   if (!PREFS.presetLib) PREFS.presetLib = [];
