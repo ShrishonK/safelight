@@ -12,6 +12,13 @@ const STILL = ['jpg', 'jpeg', 'png', 'webp', 'fedr'];
 let win = null;
 let queued = [];          // files handed to us before the window is ready
 
+// Neural denoise runs ONNX Runtime in WebAssembly. Its worker threads need
+// SharedArrayBuffer, which Chromium withholds from file:// pages unless asked;
+// without it every CPU inference runs on a single core.
+app.commandLine.appendSwitch('enable-features', 'SharedArrayBuffer');
+// WebGPU is still behind a flag on Linux builds of Chromium.
+if (process.platform === 'linux') app.commandLine.appendSwitch('enable-unsafe-webgpu');
+
 /* ---------- tiny persistent store ---------- */
 function readStore() {
   try { return JSON.parse(fs.readFileSync(STORE, 'utf8')); } catch { return {}; }
@@ -217,6 +224,64 @@ ipcMain.handle('folder:pick', async () => {
   if (r.canceled || !r.filePaths[0]) return null;
   st.lastFolder = r.filePaths[0]; writeStore(st);
   return r.filePaths[0];
+});
+
+ipcMain.handle('folder:choose', async (_e, { title, defaultPath }) => {
+  const r = await dialog.showOpenDialog(win, {
+    title: title || 'Choose a folder', properties: ['openDirectory', 'createDirectory'],
+    defaultPath: defaultPath || app.getPath('pictures')
+  });
+  return r.canceled || !r.filePaths[0] ? null : r.filePaths[0];
+});
+
+/* ---------- moving culled photos ---------- */
+// never overwrite: a clash becomes "name (1).ext", "name (2).ext", ...
+function freeName(dir, name) {
+  const ext = path.extname(name), base = name.slice(0, name.length - ext.length);
+  let p = path.join(dir, name);
+  for (let n = 1; fs.existsSync(p); n++) p = path.join(dir, `${base} (${n})${ext}`);
+  return p;
+}
+function moveFile(from, to) {
+  try { fs.renameSync(from, to); }
+  catch (e) {
+    if (e.code !== 'EXDEV') throw e;           // another drive: copy, then remove
+    fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
+    fs.unlinkSync(from);
+  }
+}
+// sidecars written by Lightroom/Capture One (.xmp) and by us (.slcar) travel with their photo
+function sidecarsOf(p) {
+  const ext = path.extname(p), base = p.slice(0, p.length - ext.length);
+  const out = [];
+  for (const stem of [base, p]) for (const sx of ['.xmp', '.XMP', '.slcar']) {
+    const sp = stem + sx;
+    if (fs.existsSync(sp) && !out.some(o => o.path.toLowerCase() === sp.toLowerCase())) out.push({ path: sp, stem, sx });
+  }
+  return out;
+}
+ipcMain.handle('files:move', (_e, { paths, parent, name }) => {
+  name = String(name || '').trim();
+  if (!name || name === '.' || name === '..' || /[\\/:*?"<>|]/.test(name)) return { error: 'that is not a usable folder name' };
+  const dest = path.join(parent, name);
+  try { fs.mkdirSync(dest, { recursive: true }); }
+  catch (e) { return { error: e.message }; }
+  const moved = paths.map(from => {
+    try {
+      if (path.resolve(path.dirname(from)) === path.resolve(dest)) return { from, to: from };
+      const sides = sidecarsOf(from);
+      const to = freeName(dest, path.basename(from));
+      moveFile(from, to);
+      const toExt = path.extname(to), toBase = to.slice(0, to.length - toExt.length);
+      for (const sc of sides) {
+        const target = (sc.stem === from ? to : toBase) + sc.sx;
+        try { moveFile(sc.path, fs.existsSync(target) ? freeName(dest, path.basename(target)) : target); }
+        catch (e) { console.warn('sidecar move failed', sc.path, e.message); }
+      }
+      return { from, to };
+    } catch (e) { return { from, error: e.message }; }
+  });
+  return { dest, moved };
 });
 
 ipcMain.handle('asset:read', (_e, rel) => {

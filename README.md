@@ -84,6 +84,16 @@ that every slider is live. JPEG, PNG and WebP open instantly.
 settings between frames, `⇧1`–`⇧9` to save a look and `1`–`9` to apply it. Presets survive
 restarts. Export one photo with a save dialog, or the whole roll into a folder.
 
+**Culling** — switch the top-left toggle from **Edit** to **Cull** for a full-window viewer that
+shows each file's embedded preview, so even a card of raws steps instantly. `←` `→` (or the side
+arrows) move, the ribbon along the bottom shows the seven frames either side, and `K` flags a
+keeper — flagged frames carry an amber bar in the ribbon and the filmstrip. **Move flagged to new
+workspace…** moves those files (with any `.xmp` / `.slcar` sidecars) into a new folder and opens
+it in its own tab, back in Edit mode. Both modes can sort the folder by name or by file type.
+
+**Workspaces** — each tab above the filmstrip is a folder. `+` opens another; tabs and your
+place in each come back after a restart.
+
 ## Shortcuts
 
 | | |
@@ -98,6 +108,8 @@ restarts. Export one photo with a save dialog, or the whole roll into a folder.
 | `O` | mask overlay on/off |
 | `[` `]` | brush size |
 | `⌘Z` / `⇧⌘Z` | undo / redo |
+| `K` (cull) | flag / unflag |
+| `Enter` / `Esc` (cull) | back to Edit on this photo |
 | `←` `→` | previous / next photo |
 | `⌘E` / `⇧⌘E` | export photo / all photos |
 

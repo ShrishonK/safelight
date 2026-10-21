@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld('native', {
   scanFolder: (dir) => ipcRenderer.invoke('folder:scan', dir),
   // File.path was removed from Electron; this is the supported replacement
   pathForFile: (file) => { try { return webUtils.getPathForFile(file); } catch { return ''; } },
+  chooseDir: (title, defaultPath) => ipcRenderer.invoke('folder:choose', { title, defaultPath }),
+  moveFiles: (paths, parent, name) => ipcRenderer.invoke('files:move', { paths, parent, name }),
   readFiles: (paths) => ipcRenderer.invoke('file:read', paths),
   saveAs: (defaultName, filters, bytes) => ipcRenderer.invoke('dialog:save', { defaultName, filters, bytes }),
   chooseFolder: () => ipcRenderer.invoke('dialog:folder'),
