@@ -278,8 +278,10 @@ function fileThumb(f, i) {
   const ed = document.createElement('div'); ed.className = 'edited';
   const op = document.createElement('div'); op.className = 'open';
   const fl = document.createElement('div'); fl.className = 'flag';
-  d.append(img, cap, ed, op, fl);
+  const dn = document.createElement('div'); dn.className = 'dn';
+  d.append(img, cap, ed, op, fl, dn);
   if (typeof CULL !== 'undefined' && CULL.picks.has(f.path)) d.classList.add('is-flagged');
+  if (typeof bdThumbClass === 'function') { const c = bdThumbClass(f.path); if (c) d.classList.add(c); }
   if (FOLDER.selectMode) { const s = document.createElement('div'); s.className = 'sel-badge'; d.append(s); }
   d.onclick = () => FOLDER.selectMode ? toggleSelect(f.path) : openPhotoAt(i);
   d.oncontextmenu = e => { e.preventDefault(); showThumbMenu(e, f); };
@@ -464,10 +466,9 @@ async function makeThumb(path, gen) {
     } else if (/\.fedr$/i.test(path)) {
       const [f] = await N.readFiles([path]);
       if (!f) throw new Error('could not read');
-      const buf = f.bytes.buffer.slice(f.bytes.byteOffset, f.bytes.byteOffset + f.bytes.byteLength);
-      const dv = new DataView(buf), hlen = dv.getUint32(4, true);
-      const head = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, hlen)));
-      blob = await (await fetch(thumbFromHalf(new Uint16Array(buf, 8 + hlen, head.width * head.height * 4), head.width, head.height))).blob();
+      const { head, data } = await readFedr(new Uint8Array(f.bytes));
+      blob = await (await fetch(thumbFromHalf(data, head.width, head.height))).blob();
+      if (blob) N.thumbPut(path, new Uint8Array(await blob.arrayBuffer()));
     } else {
       throw new Error('no embedded preview');
     }

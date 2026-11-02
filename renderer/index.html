@@ -134,6 +134,11 @@
       color: var(--dim)
     }
 
+    #sortbar .tb {
+      padding: 3px 7px;
+      font-size: 11px
+    }
+
     #sortbar select,
     #cullbar select {
       min-width: 0;
@@ -783,6 +788,141 @@
       pointer-events: none
     }
 
+    /* ---------- background batch denoise ---------- */
+    #dnpill {
+      position: absolute;
+      left: 10px;
+      bottom: 10px;
+      z-index: 4;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      max-width: calc(100% - 20px);
+      font: 400 10px/1 var(--mono);
+      color: var(--dim);
+      background: rgba(10, 14, 18, .82);
+      border: 1px solid var(--line);
+      border-radius: var(--r);
+      padding: 5px 6px 7px 8px;
+      overflow: hidden
+    }
+
+    #dnpill[hidden] {
+      display: none
+    }
+
+    #dnpill .t {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis
+    }
+
+    #dnpill i {
+      flex: none;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      border: 1.5px solid var(--line-hi);
+      border-top-color: var(--keep);
+      animation: spin .8s linear infinite
+    }
+
+    #dnpill.paused i,
+    #dnpill.final i {
+      animation: none;
+      border-color: var(--keep)
+    }
+
+    #dnpill.bad {
+      cursor: pointer;
+      color: var(--text)
+    }
+
+    #dnpill.bad i {
+      border-color: var(--clip)
+    }
+
+    #dnpill button {
+      flex: none;
+      background: none;
+      border: 1px solid transparent;
+      border-radius: var(--r);
+      color: var(--dim);
+      font-size: 9px;
+      line-height: 1;
+      padding: 2px 4px;
+      cursor: pointer
+    }
+
+    #dnpill button:hover {
+      color: var(--text);
+      border-color: var(--line-hi)
+    }
+
+    #dnpill button[hidden] {
+      display: none
+    }
+
+    #dnpill .bar {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 2px;
+      background: var(--line)
+    }
+
+    #dnpill .bar b {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: var(--keep);
+      transition: width .3s
+    }
+
+    /* filmstrip: waiting for its turn, or being denoised right now */
+    .thumb .dn {
+      display: none;
+      position: absolute;
+      top: 3px;
+      right: 11px;
+      font: 600 8px/1 var(--mono);
+      letter-spacing: .04em;
+      padding: 2px 3px;
+      border-radius: 2px;
+      pointer-events: none
+    }
+
+    .thumb.dn-queued .dn,
+    .thumb.dn-working .dn {
+      display: block
+    }
+
+    .thumb.dn-queued .dn {
+      color: var(--dim);
+      background: rgba(10, 14, 18, .75)
+    }
+
+    .thumb.dn-queued .dn::after {
+      content: "DN"
+    }
+
+    .thumb.dn-working .dn {
+      color: #0a0e12;
+      background: var(--keep);
+      animation: dnpulse 1.2s ease-in-out infinite
+    }
+
+    .thumb.dn-working .dn::after {
+      content: "DN…"
+    }
+
+    @keyframes dnpulse {
+      50% {
+        opacity: .45
+      }
+    }
+
     #loadpill[hidden] {
       display: none
     }
@@ -1345,6 +1485,7 @@
     <div class="spacer"></div>
     <span class="stat" id="cullCount">nothing flagged</span>
     <button class="tb" id="cullUndo" hidden>Move back</button>
+    <button class="tb bdBtn" title="Denoise every raw in this folder in the background (Ctrl+Shift+D)">Denoise all</button>
     <button class="tb primary" id="cullMove">Move to new workspace…</button>
     <select id="cullFilter" title="Which files to show">
       <option value="all">All files</option>
@@ -1365,6 +1506,8 @@
       <div id="sortbar">
         <span>Sort</span>
         <select class="sortSel" title="Sort the folder"></select>
+        <span class="spacer"></span>
+        <button class="tb bdBtn" title="Denoise every raw in this folder in the background (Ctrl+Shift+D)">Denoise all</button>
       </div>
       <div id="selbar" hidden>
         <span id="selCount" class="stat"></span>
@@ -1385,6 +1528,7 @@
       <canvas id="gl"></canvas>
       <canvas id="overlay"></canvas>
       <div id="loadpill" hidden><i></i><span></span></div>
+      <div id="dnpill" hidden><i></i><span class="t"></span><button id="dnPause" title="Pause">❚❚</button><button id="dnStop" title="Stop">■</button><div class="bar"><b></b></div></div>
       <div id="badge" hidden></div>
       <div id="flagbadge" hidden>KEEP</div>
       <button class="cnav" id="cullPrev" title="Previous (←)">‹</button>
@@ -1423,6 +1567,7 @@
   <script src="cull.js"></script>
   <script src="exif.js"></script>
   <script src="subject.js"></script>
+  <script src="batchdenoise.js"></script>
 </body>
 
 </html>

@@ -109,6 +109,19 @@ were on in each, come back after a restart. Both modes can sort a folder by name
 threads; the Device setting in its dialog forces one or the other, and the finished message says
 which ran. An fp16 export of a model runs about twice as fast on a GPU.
 
+**Denoise a whole folder in the background** — **Denoise all** (above the filmstrip, in the Cull bar,
+or `Ctrl+Shift+D`) runs the neural denoiser over every raw in the workspace while you keep working.
+Each raw is replaced in the folder by a denoised linear raw — a `.fedr` with the same name — and the
+original raw moves into an **Originals** folder beside it, never deleted. Edits carry over: the
+denoised file sits at the raw's own exposure, so a look you made on the raw fits it unchanged, and a
+photo you are editing when its turn comes just gets cleaner pixels under your sliders. A small pill
+in the corner of the photo shows which frame is running, how far along it is and roughly how long is
+left, with pause and stop; queued frames carry a **DN** badge in the filmstrip. Stopping keeps
+whatever is already finished. Pressing the button again later picks up the raws still left. Before a
+frame goes through the network it is lifted to the exposure you edit it at (or to a typical
+mid-grey if it is unedited), so the model sees the noise as you will; highlights that lift would clip
+keep their original pixels. On a machine with two GPUs WebGPU picks the high-performance one.
+
 **Getting through a shoot** — filmstrip on the left, arrow keys to move, `⌥⌘C` / `⌥⌘V` to copy
 settings between frames, `⇧1`–`⇧9` to save a look and `1`–`9` to apply it. Presets survive
 restarts. Export one photo with a save dialog, or the whole roll into a folder.
@@ -132,6 +145,7 @@ restarts. Export one photo with a save dialog, or the whole roll into a folder.
 | `⌘Z` / `⇧⌘Z` | undo / redo |
 | `←` `→` | previous / next photo |
 | `⌘E` / `⇧⌘E` | export photo / all photos |
+| `⇧⌘D` | denoise every raw in the folder (background) |
 
 Drag any slider's **label** to scrub it; hold shift for fine steps; double-click to reset.
 
@@ -159,10 +173,17 @@ renderer/loader.js   photos in memory: preview → half → full, worker pool, m
 renderer/rawworker.js  raw decoding off the interface thread
 renderer/folder.js   folder browser, filmstrip, thumbnails
 renderer/cull.js     Cull mode: flags, file-type filter, moving the keepers to a new workspace
+renderer/batchdenoise.js  Denoise all: the background queue, the status pill, swapping raws for .fedr
+renderer/denoiseworker.js the neural denoiser in a worker, so a long batch never blocks the interface
+renderer/fedrworker.js    unpacks compressed .fedr files off the interface thread
 renderer/vendor/     dcraw compiled to JavaScript (patched; see the note at the top of dcraw.js)
 tools/rawprep.py     fallback converter if a camera the bundled decoder doesn't know shows up
 build/               icon and macOS entitlements
 ```
+
+`.fedr` files written by the batch denoiser are compressed (header `"version": 2,
+"compression": "deflate-shuffle"`) — about half the size of an uncompressed one — and carry the raw's
+capture data. Safelight 1.8 and earlier can't open these.
 
 `tools/rawprep.py` (needs `pip install rawpy numpy pillow`) writes `.fedr` files — the same
 linear format the app uses internally — for any raw the built-in decoder chokes on:

@@ -97,6 +97,7 @@ function buildMenu() {
       { label: 'Export selected photos…', click: menuSend('export-selected') },
       { type: 'separator' },
       { label: 'Convert raw to .fedr…', click: menuSend('convert-raw') },
+      { label: 'Denoise every raw in this folder…', accelerator: 'CmdOrCtrl+Shift+D', click: menuSend('denoise-folder') },
       { type: 'separator' },
       { label: 'Select subject', accelerator: 'CmdOrCtrl+Shift+S', click: menuSend('select-subject') },
       { label: 'Save settings sidecar…', click: menuSend('save-sidecar') },
@@ -341,6 +342,39 @@ ipcMain.handle('cull:move', async (_e, items) => {
     }
   }
   return out;
+});
+
+/* ---------- batch denoise: a raw is replaced by its denoised .fedr ----------
+   The new file is written beside the raw under a temporary name and only
+   renamed into place once it is complete. The raw itself is never deleted:
+   it moves into an "Originals" folder next to it, with its sidecars, so the
+   swap can always be undone by hand. The photo's edits move to the new file. */
+ipcMain.handle('denoise:commit', async (_e, { raw, bytes }) => {
+  const dir = path.dirname(raw);
+  const stem = path.basename(raw, path.extname(raw));
+  let tmp = null;
+  try {
+    await fs.promises.access(raw);                      // moved or culled away meanwhile: nothing to replace
+    tmp = path.join(dir, '.' + stem + '.fedr.' + process.pid + '.part');
+    await fs.promises.writeFile(tmp, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+    const dest = await freeName(dir, stem + '.fedr');
+    await fs.promises.rename(tmp, dest);
+    tmp = null;
+    let original = null;
+    try {
+      original = await moveOne(raw, path.join(dir, 'Originals'));
+      await moveSidecars(raw, original);
+    } catch (e) {
+      // the denoised file is in place but the raw could not move: take the new file back out
+      await fs.promises.unlink(dest).catch(() => { });
+      throw e;
+    }
+    moveEditRecord(raw, dest);
+    return { ok: true, fedr: dest, original };
+  } catch (e) {
+    if (tmp) await fs.promises.unlink(tmp).catch(() => { });
+    return { ok: false, error: moveTrouble(e) };
+  }
 });
 
 ipcMain.handle('asset:read', (_e, rel) => {

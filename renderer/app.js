@@ -2026,21 +2026,50 @@ async function loadStd(file) {
   return im;
 }
 
-/* .fedr : "FEDR" | u32 headerLen | JSON header | float16 RGBA planarless */
-async function loadFedr(file) {
-  const buf = await file.arrayBuffer();
+/* .fedr : "FEDR" | u32 headerLen | JSON header | float16 RGBA planarless
+   v2 files (written by the batch denoiser) carry compression: 'deflate-shuffle' —
+   the same pixels with each half float's low and high bytes in two planes, deflated. */
+async function readFedr(buf) {
+  if (buf instanceof Uint8Array) buf = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
   const dv = new DataView(buf);
   const magic = String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
   if (magic !== 'FEDR') throw new Error('not a fedr file');
   const hlen = dv.getUint32(4, true);
   const head = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, hlen)));
+  const n = head.width * head.height * 4;
+  if (!head.compression) return { head, data: new Uint16Array(buf, 8 + hlen, n) };
+  if (head.compression !== 'deflate-shuffle') throw new Error('this .fedr uses a compression this version does not know');
+  try {
+    const data = await new Promise((res, rej) => {
+      const w = new Worker('fedrworker.js');
+      w.onmessage = e => { w.terminate(); e.data.ok ? res(e.data.data) : rej(new Error(e.data.error)); };
+      w.onerror = ev => { ev.preventDefault(); w.terminate(); rej(Object.assign(new Error(ev.message || 'worker failed'), { noWorker: true })); };
+      w.postMessage({ buf, offset: 8 + hlen, n }, [buf]);
+    });
+    return { head, data };
+  } catch (e) {
+    if (!e.noWorker) throw e;
+    console.warn('fedr worker unavailable, unpacking here', e.message);
+  }
+  const packed = new Uint8Array(buf, 8 + hlen);
+  const shuf = new Uint8Array(await new Response(new Blob([packed]).stream().pipeThrough(new DecompressionStream('deflate'))).arrayBuffer());
+  if (shuf.length !== n * 2) throw new Error('this .fedr is damaged or incomplete');
+  const data = new Uint16Array(n), u8 = new Uint8Array(data.buffer);
+  for (let i = 0; i < n; i++) { u8[2 * i] = shuf[i]; u8[2 * i + 1] = shuf[n + i]; }
+  return { head, data };
+}
+
+async function loadFedr(file) {
+  const { head, data } = await readFedr(await file.arrayBuffer());
   const w = head.width, h = head.height;
-  const data = new Uint16Array(buf, 8 + hlen, w * h * 4);
   const im = baseImage(head.name || file.name, w, h, true);
   im.meta = head;
-  im.tex = storageTex(gl.RGBA16F, w, h);
-  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.HALF_FLOAT, data);
+  if (typeof uploadHalfFloat === 'function') im.tex = await uploadHalfFloat(w, h, data);   // in bands, so painting never stalls
+  else {
+    im.tex = storageTex(gl.RGBA16F, w, h);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.HALF_FLOAT, data);
+  }
   im.thumb = thumbFromHalf(data, w, h);
   if (head.camera) im.name = head.name || file.name;
   return im;

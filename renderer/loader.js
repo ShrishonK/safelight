@@ -202,6 +202,59 @@ function forgetPhoto(path) {
   CHECKED.delete(path);
 }
 
+/* The file behind an entry has been replaced by another at a new path (the batch
+   denoiser swaps a raw for its denoised .fedr). Settings, brush paint and undo
+   history stay with the entry; only its pixels are reloaded. The photo on screen
+   keeps showing the old pixels until the new ones are ready, so nothing flickers. */
+function rekeyPhoto(from, to, name, pixels) {
+  name = name || baseName(to);
+  const rec = RECORDS.get(from);
+  RECORDS.delete(from); CHECKED.delete(from);
+  if (rec) RECORDS.set(to, Object.assign({}, rec, { path: to }));
+  CHECKED.add(to);
+  if (typeof THUMBS !== 'undefined' && THUMBS.has(from)) { THUMBS.set(to, THUMBS.get(from)); THUMBS.delete(from); }
+  const im = PHOTOS.get(from);
+  if (!im) return null;
+  const pending = _persistTimers.has(from);
+  clearTimeout(_persistTimers.get(from)); _persistTimers.delete(from);
+  cancelJobs(im);
+  PHOTOS.delete(from);
+  im.path = to; im.name = name; im.kind = kindOf(name);
+  PHOTOS.set(to, im);
+  if (pending) scheduleEditPersist(im);               // a change made in the last moment still lands
+  if (!im.tex) { if (im.path) im.stage = 'cold'; return im; }
+  if (im === IM() || im.pin) {
+    im.jobs.load = reloadPixels(im, pixels).finally(() => { delete im.jobs.load; });
+  } else {
+    dropTextures(im);
+  }
+  return im;
+}
+
+/* pixels: { w, h, rgba } when the caller already has the new file's pixels in hand */
+async function reloadPixels(im, pixels) {
+  try {
+    let x;
+    if (pixels && pixels.rgba) {
+      x = { w: pixels.w, h: pixels.h, tex: await uploadHalfFloat(pixels.w, pixels.h, new Uint16Array(pixels.rgba)) };
+    } else {
+      const [f] = await N.readFiles([im.path]);
+      if (!f) throw new Error('could not read the file');
+      x = await loadFedr(new File([f.bytes], im.name));
+    }
+    if (!alive(im)) { gl.deleteTexture(x.tex); return; }
+    if (x.meta) noteMeta(im, x.meta);
+    if (im.texLo) { gl.deleteTexture(im.texLo); im.texLo = null; im.texLoBytes = 0; }
+    if (im.tex) gl.deleteTexture(im.tex);
+    im.tex = null; im.texBytes = 0; im.stage = 'cold';
+    installTexture(im, x.tex, x.w, x.h, 'full', x.w * x.h * 8);
+  } catch (e) {
+    console.error('reload after denoise failed', im.path, e);
+    dropTextures(im);
+    if (im === IM()) want(im, 'full', 0);
+  }
+}
+
 /* entries from other folders that aren't on screen are closed when the folder changes */
 function pruneEntries(keep) {
   const cur = IM();
@@ -639,6 +692,8 @@ async function loadStill(im) {
     const x = im.kind === 'fedr' ? await loadFedr(file) : await loadStd(file);
     if (!alive(im) || rank(im) >= RANK.full) { gl.deleteTexture(x.tex); return; }
     if (x.meta) noteMeta(im, x.meta);
+    // a denoised .fedr carries the raw's EXIF, since the file itself has none to parse
+    if (x.meta && x.meta.exif && !im.exif) { im.exif = x.meta.exif; im.capture = null; if (im === IM() && typeof updateCapture === 'function') updateCapture(); }
     if (!im.thumb) im.thumb = x.thumb;
     installTexture(im, x.tex, x.w, x.h, 'full', x.w * x.h * (im.kind === 'fedr' ? 8 : 4));
   } catch (e) {
