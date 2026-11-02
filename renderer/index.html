@@ -134,6 +134,16 @@
       color: var(--dim)
     }
 
+    .cacheStat {
+      font: 400 10px/1 var(--mono);
+      color: var(--faint);
+      white-space: nowrap
+    }
+
+    .cacheStat[hidden] {
+      display: none
+    }
+
     #sortbar .tb {
       padding: 3px 7px;
       font-size: 11px
@@ -1483,6 +1493,7 @@
     <span class="clabel">Sort</span>
     <select class="sortSel" title="Sort the folder"></select>
     <div class="spacer"></div>
+    <span class="cacheStat" hidden></span>
     <span class="stat" id="cullCount">nothing flagged</span>
     <button class="tb" id="cullUndo" hidden>Move back</button>
     <button class="tb bdBtn" title="Denoise every raw in this folder in the background (Ctrl+Shift+D)">Denoise all</button>
@@ -1507,6 +1518,7 @@
         <span>Sort</span>
         <select class="sortSel" title="Sort the folder"></select>
         <span class="spacer"></span>
+        <span class="cacheStat" hidden></span>
         <button class="tb bdBtn" title="Denoise every raw in this folder in the background (Ctrl+Shift+D)">Denoise all</button>
       </div>
       <div id="selbar" hidden>
@@ -1562,6 +1574,7 @@
   <script src="app.js"></script>
   <script src="native.js"></script>
   <script src="loader.js"></script>
+  <script src="rawcache.js"></script>
   <script src="ai.js"></script>
   <script src="folder.js"></script>
   <script src="cull.js"></script>

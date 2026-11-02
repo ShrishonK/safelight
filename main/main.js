@@ -9,6 +9,7 @@ const IS_MAC = process.platform === 'darwin';
 const STORE = path.join(app.getPath('userData'), 'safelight.json');
 const EDIT_DIR = path.join(app.getPath('userData'), 'edits');     // one small file per edited photo
 const THUMB_DIR = path.join(app.getPath('userData'), 'thumbs');   // strip thumbnails, so folders reopen instantly
+const DECODE_DIR = path.join(app.getPath('userData'), 'decoded');  // raws already demosaiced, so they open in a moment
 
 const RAW = ['cr2', 'cr3', 'nef', 'arw', 'raf', 'rw2', 'orf', 'dng', 'pef', 'srw', 'raw', '3fr', 'iiq', 'erf', 'mrw'];
 const STILL = ['jpg', 'jpeg', 'png', 'webp', 'fedr'];
@@ -98,6 +99,7 @@ function buildMenu() {
       { type: 'separator' },
       { label: 'Convert raw to .fedr…', click: menuSend('convert-raw') },
       { label: 'Denoise every raw in this folder…', accelerator: 'CmdOrCtrl+Shift+D', click: menuSend('denoise-folder') },
+      { label: 'Clear decoded raw cache', click: menuSend('clear-decoded') },
       { type: 'separator' },
       { label: 'Select subject', accelerator: 'CmdOrCtrl+Shift+S', click: menuSend('select-subject') },
       { label: 'Save settings sidecar…', click: menuSend('save-sidecar') },
@@ -435,6 +437,94 @@ async function pruneThumbs(keep) {
   } catch (e) { /* nothing cached yet */ }
 }
 
+/* ---------- decoded raws ----------
+   Demosaicing a raw takes 20-30 s. Once a raw has been decoded its linear pixels
+   are kept here as a compressed .fedr, keyed by path, size and modification time
+   (a changed file is decoded afresh), so opening it again takes a moment. The
+   cache trims itself, least recently opened first, to at most 25 GB and never
+   more than a quarter of the free space on its drive. */
+const DECODE_CAP = 25 * 1024 ** 3;
+async function decodedFile(p) {
+  const st = await fs.promises.stat(p);
+  return path.join(DECODE_DIR, sha1(`${p}|${st.size}|${st.mtimeMs}`) + '.fedr');
+}
+ipcMain.handle('decoded:has', async (_e, paths) => {
+  let have;
+  try { have = new Set(await fs.promises.readdir(DECODE_DIR)); } catch { return {}; }
+  const out = {};
+  await Promise.all(paths.map(async p => {
+    try { if (have.has(path.basename(await decodedFile(p)))) out[p] = true; } catch { /* gone */ }
+  }));
+  return out;
+});
+ipcMain.handle('decoded:get', async (_e, p) => {
+  try {
+    const f = await decodedFile(p);
+    const bytes = await fs.promises.readFile(f);
+    const now = new Date();
+    fs.promises.utimes(f, now, now).catch(() => { });     // recently opened stays longest
+    return { bytes };
+  } catch { return null; }
+});
+ipcMain.handle('decoded:put', async (_e, { path: p, bytes }) => {
+  try {
+    await fs.promises.mkdir(DECODE_DIR, { recursive: true });
+    const f = await decodedFile(p);
+    const tmp = f + '.' + process.pid + '.' + Date.now() + '.part';
+    await fs.promises.writeFile(tmp, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+    await fs.promises.rename(tmp, f);
+    scheduleDecodedPrune();
+    return true;
+  } catch (e) { console.error('decoded cache write failed', e); return false; }
+});
+ipcMain.handle('decoded:usage', async () => {
+  try {
+    let total = 0, n = 0;
+    for (const name of await fs.promises.readdir(DECODE_DIR)) {
+      try { total += (await fs.promises.stat(path.join(DECODE_DIR, name))).size; n++; } catch { }
+    }
+    return { bytes: total, files: n, cap: await decodedCap() };
+  } catch { return { bytes: 0, files: 0, cap: await decodedCap() }; }
+});
+ipcMain.handle('decoded:clear', async () => {
+  try { for (const name of await fs.promises.readdir(DECODE_DIR)) await fs.promises.unlink(path.join(DECODE_DIR, name)).catch(() => { }); }
+  catch { }
+  return true;
+});
+async function decodedCap() {
+  try {
+    await fs.promises.mkdir(DECODE_DIR, { recursive: true });
+    const sf = await fs.promises.statfs(DECODE_DIR);
+    const free = sf.bavail * sf.bsize;
+    return Math.min(DECODE_CAP, Math.max(2 * 1024 ** 3, free * 0.25));
+  } catch { return 8 * 1024 ** 3; }
+}
+let _pruneTimer = null, _pruning = false;
+function scheduleDecodedPrune() {
+  clearTimeout(_pruneTimer);
+  _pruneTimer = setTimeout(pruneDecoded, 3000);
+}
+async function pruneDecoded() {
+  if (_pruning) return;
+  _pruning = true;
+  try {
+    const names = await fs.promises.readdir(DECODE_DIR);
+    const stats = (await Promise.all(names.map(async n => {
+      try { const st = await fs.promises.stat(path.join(DECODE_DIR, n)); return { n, size: st.size, t: st.mtimeMs }; } catch { return null; }
+    }))).filter(Boolean);
+    // leftovers of a write that never finished
+    for (const s of stats) if (s.n.endsWith('.part') && Date.now() - s.t > 3600e3) await fs.promises.unlink(path.join(DECODE_DIR, s.n)).catch(() => { });
+    const cap = await decodedCap();
+    let total = stats.reduce((a, s) => a + s.size, 0);
+    for (const s of stats.filter(s => s.n.endsWith('.fedr')).sort((a, b) => a.t - b.t)) {
+      if (total <= cap) break;
+      await fs.promises.unlink(path.join(DECODE_DIR, s.n)).catch(() => { });
+      total -= s.size;
+    }
+  } catch (e) { /* nothing cached yet */ }
+  finally { _pruning = false; }
+}
+
 /* ---------- per-photo edits ----------
    Edits never touch the original file. Each edited photo gets a small record here,
    keyed by its absolute path, so a look survives switching photos, closing the
@@ -517,6 +607,7 @@ else {
     buildMenu();
     createWindow();
     pruneThumbs(8000);
+    pruneDecoded();
     const files = process.argv.slice(1).filter(a => !a.startsWith('-') && fs.existsSync(a) && fs.statSync(a).isFile());
     if (files.length) queued.push(...await describeAll(files));
     app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow(); });

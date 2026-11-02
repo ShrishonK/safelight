@@ -109,6 +109,15 @@ were on in each, come back after a restart. Both modes can sort a folder by name
 threads; the Device setting in its dialog forces one or the other, and the finished message says
 which ran. An fp16 export of a model runs about twice as fast on a GPU.
 
+**Every raw in a folder decoded ahead of you** — opening a folder starts a background pass that
+decodes its raws one after another, from the photo you're on outwards, and keeps each result on disk
+(a compressed linear `.fedr` in the app's data folder). After that a raw opens at full resolution in a
+second or two instead of waiting 20–30 s for the demosaic, and the batch denoiser reads from the same
+cache. A small "Decoding 12/83" note above the filmstrip shows the pass while it runs. Raws you open
+yourself are cached by their own decode. The cache is keyed by path, size and date, so an edited or
+replaced file is decoded afresh; it trims itself, least recently opened first, to at most 25 GB and
+never more than a quarter of the drive's free space. File → Clear decoded raw cache empties it.
+
 **Denoise a whole folder in the background** — **Denoise all** (above the filmstrip, in the Cull bar,
 or `Ctrl+Shift+D`) runs the neural denoiser over every raw in the workspace while you keep working.
 Each raw is replaced in the folder by a denoised linear raw — a `.fedr` with the same name — and the
@@ -173,7 +182,9 @@ renderer/loader.js   photos in memory: preview → half → full, worker pool, m
 renderer/rawworker.js  raw decoding off the interface thread
 renderer/folder.js   folder browser, filmstrip, thumbnails
 renderer/cull.js     Cull mode: flags, file-type filter, moving the keepers to a new workspace
+renderer/rawcache.js      decoding a folder's raws in the background, and the on-disk cache of decodes
 renderer/batchdenoise.js  Denoise all: the background queue, the status pill, swapping raws for .fedr
+renderer/denoisecore.js   the tiled network pass, shared by the page (GPU) and the denoise worker
 renderer/denoiseworker.js the neural denoiser in a worker, so a long batch never blocks the interface
 renderer/fedrworker.js    unpacks compressed .fedr files off the interface thread
 renderer/vendor/     dcraw compiled to JavaScript (patched; see the note at the top of dcraw.js)

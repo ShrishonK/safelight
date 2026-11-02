@@ -586,6 +586,14 @@ function want(im, stage, prio) {
     return;
   }
   const onScreen = im === IM();
+  // decoded before (rawcache.js): no decoder at all, straight to full resolution
+  if (typeof DECODED !== 'undefined' && DECODED.has(im.path)) {
+    if (onScreen && rank(im) < RANK.preview && !im.jobs.preview) im.jobs.preview = loadPreview(im);
+    // a neighbour being prefetched needs nothing: from the cache it opens quickly anyway
+    if (!onScreen && target < RANK.full && !im.waiters.length && !im.pin) return;
+    if (!im.jobs.cache) im.jobs.cache = loadCachedRaw(im, stage, prio);
+    return;
+  }
   if (onScreen && rank(im) < RANK.preview && !im.jobs.preview) im.jobs.preview = loadPreview(im);
   // a photo on screen goes through the half-size copy; one wanted only for export skips it
   if (rank(im) < RANK.half && (target === RANK.half || onScreen)) {
@@ -593,7 +601,10 @@ function want(im, stage, prio) {
     else if (im.jobs.half.prio > prio) { im.jobs.half.prio = prio; pumpRaw(); }
   }
   if (target >= RANK.full) {
-    if (im.jobs.full) {
+    if (typeof PRE !== 'undefined' && PRE.inflight.has(im.path) && !im.jobs.full) {
+      // the background pass is already decoding this one: wait for it rather than start over
+      im.cacheWait = true;
+    } else if (im.jobs.full) {
       if (im.jobs.full.prio > prio + 1) { im.jobs.full.prio = prio + 1; pumpRaw(); }
     } else if (im.jobs.half && rank(im) < RANK.half) {
       // start the long demosaic only once the half-size copy (seconds away) is on screen
@@ -651,6 +662,8 @@ function decodeStage(im, half, prio) {
     noteMeta(im, r.meta);
     if (!alive(im) || rank(im) >= RANK[stage]) return;
     const t = await uploadHalfFloat(r.w, r.h, r.rgba);
+    // a full decode is kept, so this photo opens in a moment next time
+    if (!half && typeof cacheDecoded === 'function') cacheDecoded(im.path, { w: r.w, h: r.h, rgba: r.rgba, meta: im.meta, exif: im.exif, reduced: r.reduced });
     r.rgba = null;
     if (!alive(im) || rank(im) >= RANK[stage]) { gl.deleteTexture(t); return; }
     let w = r.w, h = r.h;
@@ -793,8 +806,10 @@ function loadPillSync() {
   const im = IM();
   let msg = '';
   if (im && im.path) {
-    const busyHalf = im.jobs.half || im.jobs.load || im.jobs.preview;
-    if (rank(im) < RANK.half && (busyHalf || im.stage === 'cold')) msg = im.kind === 'raw' ? 'Developing raw' : 'Loading';
+    const busyHalf = im.jobs.half || im.jobs.load || im.jobs.preview || im.jobs.cache;
+    if (im.jobs.cache && rank(im) < RANK.full) msg = 'Loading';
+    else if (rank(im) < RANK.half && (busyHalf || im.stage === 'cold')) msg = im.kind === 'raw' ? 'Developing raw' : 'Loading';
+    else if (im.cacheWait && rank(im) < RANK.full && A.view.zoom > (A.view.fitZoom || 0) * 1.05) msg = 'Loading full resolution';
     else if (im.stage === 'half' && im.jobs.full && A.view.zoom > (A.view.fitZoom || 0) * 1.05) msg = 'Loading full resolution';
   }
   pill.hidden = !msg;

@@ -205,33 +205,23 @@ function bdDenoiseFrame(frame) {
 }
 
 /* ---------- decoding ----------
-   The batch decodes in a raw worker of its own rather than through the app's
-   shared queue. In that queue the photo you click on takes a busy decoder from
-   background work and the background job starts over, so editing while a batch
-   ran kept throwing away 20-30 s decodes. Here nothing can bump it. */
+   A raw the background pass (rawcache.js) has already decoded comes straight
+   from the cache; one it's decoding right now is waited for; anything else is
+   decoded in a worker of the batch's own, which nothing can interrupt. */
 function bdDecode(item) {
-  let worker = null, cancelled = false;
+  let inner = null, cancelled = false;
   const p = (async () => {
-    const t0 = performance.now();
-    const [f] = await N.readFiles([item.raw]);
-    if (!f) throw new Error('could not read the file');
+    if (typeof PRE !== 'undefined' && PRE.inflight.has(item.raw)) { try { await PRE.inflight.get(item.raw); } catch { } }
     if (cancelled) throw new Error('cancelled');
-    let exif = null;
-    try { exif = typeof parseExif === 'function' ? parseExif(new Uint8Array(f.bytes).subarray(0, 384 * 1024)) : null; } catch { exif = null; }
-    const buf = standalone(f.bytes);
-    const r = await new Promise((res, rej) => {
-      worker = new Worker('rawworker.js');
-      worker.onmessage = e => e.data.ok ? res(e.data) : rej(new Error(e.data.error));
-      worker.onerror = ev => { ev.preventDefault(); rej(new Error(ev.message || 'the raw decoder stopped')); };
-      worker.postMessage({ id: 1, bytes: buf, half: false, maxTex: maxTexture(), skipIdentify: false }, [buf]);
-    });
-    if (worker) worker.terminate();          // hands the decoder's heap straight back
-    worker = null;
+    if (typeof DECODED !== 'undefined' && DECODED.has(item.raw)) {
+      try { const r = await loadDecoded(item.raw); if (r) return r; } catch (e) { console.warn('batch denoise: cache unreadable, decoding', e); }
+    }
     if (cancelled) throw new Error('cancelled');
-    return Object.assign(r, { exif, decodeSecs: (performance.now() - t0) / 1000 });
+    inner = decodeRawDetached(item.raw);
+    return await inner;
   })();
-  p.cancel = () => { cancelled = true; if (worker) worker.terminate(); worker = null; };
-  p.catch(() => { if (worker) worker.terminate(); });
+  p.cancel = () => { cancelled = true; if (inner) inner.cancel(); };
+  p.catch(() => { });
   return p;
 }
 
@@ -256,19 +246,11 @@ function bdCancelDecodes() {
 
 /* ---------- saving ----------
    Packing a frame and writing it run beside the next frame's denoise. */
-function bdEncode(head, rgba) {
-  return new Promise((res, rej) => {
-    const w = new Worker('fedrworker.js');
-    w.onmessage = e => { w.terminate(); e.data.ok ? res(e.data) : rej(new Error(e.data.error)); };
-    w.onerror = ev => { ev.preventDefault(); w.terminate(); rej(new Error(ev.message || 'could not pack the file')); };
-    w.postMessage({ type: 'encode', head, rgba: rgba.buffer }, [rgba.buffer]);
-  });
-}
 
 async function bdSave(item, out, w, h) {
   const t0 = performance.now();
   try {
-    const packed = await bdEncode(out.head, out.rgba instanceof Uint16Array ? out.rgba : new Uint16Array(out.rgba));
+    const packed = await encodeFedrBytes(out.head, out.rgba instanceof Uint16Array ? out.rgba : new Uint16Array(out.rgba));
     // whatever was just changed on this photo is on disk before its record moves
     const live = PHOTOS.get(item.raw);
     if (live) persistNow(live);
@@ -345,14 +327,14 @@ async function bdRun() {
       const meta = Object.assign({}, r.meta || {});
       if (r.exif) meta.exif = r.exif;
       const out = await bdDenoiseFrame({
-        w: r.w, h: r.h, rgba: r.rgba.buffer, meta,
+        w: r.w, h: r.h, rgba: (r.rgba.byteOffset === 0 && r.rgba.byteLength === r.rgba.buffer.byteLength ? r.rgba : r.rgba.slice()).buffer, meta,
         name: bdStem(item.name), from: item.name,
         exposure: bdExposure(item.raw),
         strength: BD.opts.strength, model: BD.opts.model || BUILTIN_DENOISE
       });
       r.rgba = null;
       BD.secs.push(out.secs);
-      console.log(`batch denoise: ${item.name} · decode ${(r.decodeSecs || 0).toFixed(1)}s (waited ${BD.waitSecs[BD.waitSecs.length - 1].toFixed(1)}s) · denoise ${out.secs.toFixed(1)}s on ${BD.label}`);
+      console.log(`batch denoise: ${item.name} · ${r.cached ? 'from cache' : 'decode'} ${(r.decodeSecs || 0).toFixed(1)}s (waited ${BD.waitSecs[BD.waitSecs.length - 1].toFixed(1)}s) · denoise ${out.secs.toFixed(1)}s on ${BD.label}`);
       // the next frame starts denoising while this one is packed and written;
       // only one waits to be written at a time, to keep memory in check
       await saving;

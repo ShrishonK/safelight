@@ -95,6 +95,8 @@ async function openFolder(dir, reopenPhoto, opts) {
   if (!opts.quiet) toast(`${r.files.length} photo${r.files.length === 1 ? '' : 's'} in ${r.name}`);
   // every thumbnail in the folder, visible ones first, so scrolling never waits
   r.files.forEach(f => requestThumb(f.path, false));
+  // and every raw decoded in the background, so each one opens in a moment (rawcache.js)
+  if (typeof precacheFolder === 'function') setTimeout(precacheFolder, 0);
   if (reopenPhoto) {
     const i = FOLDER.files.findIndex(f => f.path === reopenPhoto);
     // switching tabs brings that tab's photo back even with another one on screen
