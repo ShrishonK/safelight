@@ -12,7 +12,7 @@
    ============================================================ */
 'use strict';
 
-importScripts('vendor/ort/ort.min.js');
+importScripts('vendor/ort/ort.min.js', 'denoisecore.js');
 
 const W_ = {
   ort: null, session: null, backend: 'wasm', label: 'CPU',
@@ -81,21 +81,6 @@ async function setup(d) {
   return { label: W_.label, backend: W_.backend };
 }
 
-function modelIsHalf(sess) { try { return sess.inputMetadata[0].type === 'float16'; } catch { return false; } }
-function modelFixedSize(sess) {
-  try {
-    const s = sess.inputMetadata && sess.inputMetadata[0] && sess.inputMetadata[0].shape;
-    if (!s || s.length !== 4) return null;
-    return (typeof s[2] === 'number' && s[2] > 0 && s[2] === s[3]) ? s[2] : null;
-  } catch { return null; }
-}
-function featherWeight(i, n, ov) {
-  let w = 1;
-  if (i < ov) w *= 0.5 - 0.5 * Math.cos(Math.PI * (i + 0.5) / ov);
-  if (i >= n - ov) w *= 0.5 - 0.5 * Math.cos(Math.PI * (n - 0.5 - i) / ov);
-  return Math.max(w, 1e-4);
-}
-
 /* waits here while paused; throws once cancelled */
 async function checkpoint() {
   await new Promise(r => setTimeout(r, 0));            // let pause/cancel messages in
@@ -103,89 +88,12 @@ async function checkpoint() {
   if (W_.cancelled) throw new Error('cancelled');
 }
 
-/* src: Float32Array of gamma-encoded RGB 0..1, interleaved, W*H*3 */
-async function runTiles(src, W, H, tile, progress) {
-  const ort = W_.ort, sess = W_.session;
-  const inName = sess.inputNames[0], outName = sess.outputNames[0];
-  const half = modelIsHalf(sess), h2f = half ? H2F() : null;
-  const OV = W_.overlap;
-  const round64 = n => Math.max(64, Math.ceil(n / 64) * 64);
-  const T = modelFixedSize(sess) || Math.min(round64(tile), round64(Math.max(W, H) + 2 * OV));
-  const step = Math.max(64, T - OV * 2);
-  const starts = n => {
-    const out = [], last = n + OV - T;
-    for (let p = -OV; p < last; p += step) out.push(p);
-    out.push(Math.max(-OV, last));
-    return [...new Set(out)];
+function ctxFor(id) {
+  return {
+    ort: W_.ort, session: W_.session, backend: W_.backend, overlap: W_.overlap, tile: W_.tile,
+    progress: f => self.postMessage({ type: 'progress', id, f }),
+    checkpoint
   };
-  const xs = starts(W), ys = starts(H);
-  const acc = new Float32Array(W * H * 3), wsum = new Float32Array(W * H);
-  const total = xs.length * ys.length;
-  const plane = T * T;
-  const inF = new Float32Array(3 * plane), inH = half ? new Uint16Array(3 * plane) : null;
-  let done = 0;
-
-  for (const y0 of ys) {
-    for (const x0 of xs) {
-      await checkpoint();
-      for (let y = 0; y < T; y++) {
-        const sy = Math.min(H - 1, Math.max(0, y0 + y));
-        for (let x = 0; x < T; x++) {
-          const sx = Math.min(W - 1, Math.max(0, x0 + x));
-          const s = (sy * W + sx) * 3, d = y * T + x;
-          inF[d] = src[s]; inF[plane + d] = src[s + 1]; inF[2 * plane + d] = src[s + 2];
-        }
-      }
-      let input;
-      if (half) { for (let i = 0; i < inF.length; i++) inH[i] = toHalf(inF[i]); input = new ort.Tensor('float16', inH, [1, 3, T, T]); }
-      else input = new ort.Tensor('float32', inF, [1, 3, T, T]);
-      let res;
-      try { res = await sess.run({ [inName]: input }); }
-      catch (e) { if (done === 0) e.firstTile = true; throw e; }
-      const tensor = res[outName];
-      if (tensor.dims.length === 4 && tensor.dims[1] === 1) {
-        throw new Error('that model outputs a single-channel mask, not a photo — it is a segmentation model, not a denoiser');
-      }
-      let o = tensor.data;
-      if (half) { const f = new Float32Array(o.length); for (let i = 0; i < o.length; i++) f[i] = h2f[o[i]]; o = f; }
-      for (let y = 0; y < T; y++) {
-        const gy = y0 + y;
-        if (gy < 0 || gy >= H) continue;
-        const wy = featherWeight(y, T, OV);
-        for (let x = 0; x < T; x++) {
-          const gx = x0 + x;
-          if (gx < 0 || gx >= W) continue;
-          const w = wy * featherWeight(x, T, OV);
-          const si = y * T + x, di = (gy * W + gx) * 3;
-          acc[di] += o[si] * w; acc[di + 1] += o[plane + si] * w; acc[di + 2] += o[2 * plane + si] * w;
-          wsum[gy * W + gx] += w;
-        }
-      }
-      if (tensor.dispose) tensor.dispose();
-      done++;
-      progress(done / total);
-    }
-  }
-  for (let i = 0, p = 0; i < W * H; i++, p += 3) {
-    const w = wsum[i];
-    for (let c = 0; c < 3; c++) {
-      const v = w > 0 ? acc[p + c] / w : NaN;
-      acc[p + c] = Number.isFinite(v) ? v : src[p + c];   // never leave a hole
-    }
-  }
-  return acc;
-}
-
-async function runModel(src, W, H, progress) {
-  const fixed = modelFixedSize(W_.session);
-  let tile = W_.tile || (W_.backend === 'webgpu' ? 768 : 512);
-  for (;;) {
-    try { return await runTiles(src, W, H, fixed || tile, progress); }
-    catch (e) {
-      if (e.firstTile && !fixed && tile > 256 && !W_.cancelled) { tile /= 2; W_.tile = tile; continue; }
-      throw e;
-    }
-  }
 }
 
 /* ---------- one frame ----------
@@ -216,26 +124,25 @@ function DEC() {
   return _dec;
 }
 
-async function denoiseFrame(d) {
-  const { w: W, h: H, strength } = d;
+/* lift, encode: the network's input for one frame */
+function prepFrame(d) {
   const rgba = new Uint16Array(d.rgba);
-  const n = W * H, h2f = H2F();
+  const n = d.w * d.h, h2f = H2F();
   const gain = chooseGain(rgba, n, d.exposure);
-
   // every half float maps to one input value at this gain: a table, not 70 M pow() calls
   const enc = new Float32Array(65536);
   for (let i = 0; i < 65536; i++) { const v = h2f[i] * gain; enc[i] = Number.isFinite(v) ? clamp01(encSRGB(v > 0 ? v : 0)) : 0; }
-  let src = new Float32Array(n * 3);
+  const src = new Float32Array(n * 3);
   for (let i = 0, p = 0, q = 0; i < n; i++, p += 3, q += 4) {
     src[p] = enc[rgba[q]]; src[p + 1] = enc[rgba[q + 1]]; src[p + 2] = enc[rgba[q + 2]];
   }
-  const t0 = performance.now();
-  let out = await runModel(src, W, H, f => self.postMessage({ type: 'progress', id: d.id, f }));
-  src = null;
-  const secs = (performance.now() - t0) / 1000;
+  return { rgba, src, gain };
+}
 
-  // back to linear at the raw's own level, into the frame we were given
-  const k = Math.max(0, Math.min(1, strength == null ? 1 : strength));
+/* back to linear at the raw's own level, into the frame we were given */
+function finishFrame(d, rgba, out, gain, secs) {
+  const n = d.w * d.h, h2f = H2F();
+  const k = Math.max(0, Math.min(1, d.strength == null ? 1 : d.strength));
   const dec = DEC(), ig = 1 / gain;
   const back = v => dec[v <= 0 ? 0 : v >= 1 ? 65535 : (v * 65535 + 0.5) | 0] * ig;
   for (let i = 0, p = 0, q = 0; i < n; i++, p += 3, q += 4) {
@@ -248,15 +155,26 @@ async function denoiseFrame(d) {
     rgba[q + 1] = toHalf(g0 + (back(out[p + 1]) - g0) * mix);
     rgba[q + 2] = toHalf(b0 + (back(out[p + 2]) - b0) * mix);
   }
-  out = null;
-  await checkpoint();
-  // compressing and writing happen elsewhere, so this worker can start on the next frame
+  // compressing and writing happen elsewhere, so the next frame can start
   const head = Object.assign({}, d.meta || {}, {
-    width: W, height: H, name: d.name,
+    width: d.w, height: d.h, name: d.name,
     colorspace: 'srgb-linear', format: 'rgba16f', version: 2,
     compression: 'deflate-shuffle',
-    denoised: { model: d.model, strength: k, gain: Math.round(gain * 100) / 100, device: W_.label, seconds: Math.round(secs), from: d.from, at: new Date().toISOString() }
+    denoised: { model: d.model, strength: k, gain: Math.round(gain * 100) / 100, device: d.device || W_.label, seconds: Math.round(secs), from: d.from, at: new Date().toISOString() }
   });
+  return head;
+}
+
+/* the whole frame here, for when the network runs in this worker */
+async function denoiseFrame(d) {
+  const { rgba, src, gain } = prepFrame(d);
+  const t0 = performance.now();
+  const ctx = ctxFor(d.id);
+  const out = await DNC.runModel(ctx, src, d.w, d.h);
+  W_.tile = ctx.tile;
+  const secs = (performance.now() - t0) / 1000;
+  await checkpoint();
+  const head = finishFrame(d, rgba, out, gain, secs);
   return { head, rgba, secs, gain };
 }
 
@@ -269,6 +187,22 @@ self.onmessage = async e => {
   if (d.type === 'setup') {
     try { self.postMessage({ type: 'ready', ...(await setup(d)) }); }
     catch (err) { self.postMessage({ type: 'fatal', error: String(err && err.message || err) }); }
+    return;
+  }
+  // the page runs the network; this worker does the per-pixel work either side of it
+  if (d.type === 'prep') {
+    try {
+      const r = prepFrame(d);
+      self.postMessage({ type: 'prepped', id: d.id, rgba: r.rgba, src: r.src, gain: r.gain }, [r.rgba.buffer, r.src.buffer]);
+    } catch (err) { self.postMessage({ type: 'failed', id: d.id, error: String(err && err.message || err) }); }
+    return;
+  }
+  if (d.type === 'finish') {
+    try {
+      const rgba = new Uint16Array(d.rgba);
+      const head = finishFrame(d, rgba, new Float32Array(d.out), d.gain, d.secs);
+      self.postMessage({ type: 'finished', id: d.id, head, rgba }, [rgba.buffer]);
+    } catch (err) { self.postMessage({ type: 'failed', id: d.id, error: String(err && err.message || err) }); }
     return;
   }
   if (d.type === 'frame') {

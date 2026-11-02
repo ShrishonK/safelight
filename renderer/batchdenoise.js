@@ -54,10 +54,40 @@ async function bdModelRecord(key) {
   return { key, main: rec.main, ext: rec.ext || [] };
 }
 
+/* A GPU session on the page itself. WebGPU from the page is the path the
+   one-photo denoise has always used; from a worker it can quietly end up on
+   the CPU instead. Only a session that really came up on WebGPU is kept. */
+async function bdPageSession(rec) {
+  if (BD.opts.device === 'cpu') return null;
+  try {
+    if (!(await haveWebGPU())) return null;
+    const ort = await ensureOrt();
+    const opts = { executionProviders: ['webgpu'], graphOptimizationLevel: 'all' };
+    if (rec.ext && rec.ext.length) opts.externalData = rec.ext.map(e => ({ path: e.path, data: e.data }));
+    const sess = await ort.InferenceSession.create(rec.main, opts);
+    if (!webgpuLive(ort)) { await sess.release().catch(() => { }); return null; }
+    return sess;
+  } catch (e) {
+    console.warn('batch denoise: no GPU session on the page, trying the worker', e);
+    return null;
+  }
+}
+
 function bdStartWorker() {
   if (BD.ready) return BD.ready;
   BD.ready = (async () => {
     const rec = await bdModelRecord(BD.opts.model);
+    BD.pageSess = BD.pageSess || await bdPageSession(rec);
+    if (BD.pageSess) {
+      // the network runs here on the GPU; the worker only does the per-pixel work around it
+      const w = new Worker('denoiseworker.js');
+      BD.worker = w; BD.mode = 'page'; BD.label = 'GPU';
+      w.onmessage = e => bdOnMessage(e.data);
+      w.onerror = ev => { ev.preventDefault(); bdWorkerDied(ev.message || 'the denoise worker stopped'); };
+      console.log('batch denoise: network on the GPU (WebGPU, page)');
+      return w;
+    }
+    BD.mode = 'worker';
     const base = new URL('vendor/ort/', document.baseURI).href;
     let wasmPaths = base, threads = 1;
     const cores = navigator.hardwareConcurrency || 2;
@@ -86,6 +116,7 @@ function bdStartWorker() {
     w.postMessage({ type: 'setup', main: rec.main, ext: rec.ext, device: BD.opts.device, wasmPaths, threads });
     await answer;
     w.onerror = ev => { ev.preventDefault(); bdWorkerDied(ev.message || 'the denoise worker stopped'); };
+    console.log('batch denoise: network in the worker on', BD.label);
     return w;
   })();
   BD.ready.catch(() => { BD.ready = null; if (BD.worker) BD.worker.terminate(); BD.worker = null; });
@@ -96,6 +127,16 @@ function bdStopWorker() {
   if (BD.worker) BD.worker.terminate();
   BD.worker = null; BD.ready = null;
   if (BD.pending) { BD.pending.reject(new Error('cancelled')); BD.pending = null; }
+  bdReleasePage();
+}
+
+/* the page session is let go only once no tile is in flight on it */
+function bdReleasePage() {
+  if (!BD.pageSess) return;
+  if (BD.pageBusy) { BD.releaseAfter = true; return; }
+  const s = BD.pageSess;
+  BD.pageSess = null; BD.releaseAfter = false;
+  s.release().catch(() => { });
 }
 
 function bdWorkerDied(msg) {
@@ -110,12 +151,52 @@ function bdOnMessage(d) {
   const p = BD.pending;
   if (!p || d.id !== p.id) return;
   if (d.type === 'progress') { BD.frac = d.f; bdPill(); }
-  else if (d.type === 'done') { BD.pending = null; p.resolve(d); }
+  else if (d.type === 'done' || d.type === 'prepped' || d.type === 'finished') { BD.pending = null; p.resolve(d); }
   else if (d.type === 'failed') { BD.pending = null; p.reject(new Error(d.error)); }
 }
 
 let _bdSeq = 0;
+function bdAsk(msg, transfer) {
+  return new Promise((resolve, reject) => {
+    if (!BD.worker) { reject(new Error('cancelled')); return; }
+    BD.pending = { id: msg.id, resolve, reject };
+    BD.worker.postMessage(msg, transfer);
+  });
+}
+
+async function bdCheckpoint() {
+  await new Promise(r => setTimeout(r, 0));
+  while (BD.paused && !BD.stopping) await new Promise(r => { BD.pageWake = r; });
+  if (BD.stopping || !BD.pageSess) throw new Error('cancelled');
+}
+
+/* the GPU path: prepare in the worker, run the network here, finish in the worker */
+async function bdDenoisePage(frame) {
+  const id = ++_bdSeq;
+  const prepped = await bdAsk({ type: 'prep', id, rgba: frame.rgba, w: frame.w, h: frame.h, exposure: frame.exposure }, [frame.rgba]);
+  BD.pageBusy = true;
+  let out, secs;
+  try {
+    const ctx = {
+      ort: AI.ort, session: BD.pageSess, backend: 'webgpu', overlap: 96, tile: BD.tile || 0,
+      progress: f => { BD.frac = f; bdPill(); },
+      checkpoint: bdCheckpoint
+    };
+    const t0 = performance.now();
+    out = await DNC.runModel(ctx, new Float32Array(prepped.src.buffer || prepped.src), frame.w, frame.h);
+    BD.tile = ctx.tile;
+    secs = (performance.now() - t0) / 1000;
+  } finally {
+    BD.pageBusy = false;
+    if (BD.releaseAfter) bdReleasePage();
+  }
+  const rgba = prepped.rgba.buffer || prepped.rgba;
+  const fin = await bdAsk(Object.assign({}, frame, { type: 'finish', id: ++_bdSeq, rgba, out: out.buffer, gain: prepped.gain, secs, device: 'GPU' }), [rgba, out.buffer]);
+  return { head: fin.head, rgba: fin.rgba, secs, gain: prepped.gain };
+}
+
 function bdDenoiseFrame(frame) {
+  if (BD.mode === 'page' && BD.pageSess) return bdDenoisePage(frame);
   return new Promise((resolve, reject) => {
     BD.pending = { id: ++_bdSeq, resolve, reject };
     BD.worker.postMessage(Object.assign({ type: 'frame', id: BD.pending.id }, frame), [frame.rgba]);
@@ -187,7 +268,7 @@ function bdEncode(head, rgba) {
 async function bdSave(item, out, w, h) {
   const t0 = performance.now();
   try {
-    const packed = await bdEncode(out.head, new Uint16Array(out.rgba));
+    const packed = await bdEncode(out.head, out.rgba instanceof Uint16Array ? out.rgba : new Uint16Array(out.rgba));
     // whatever was just changed on this photo is on disk before its record moves
     const live = PHOTOS.get(item.raw);
     if (live) persistNow(live);
@@ -260,7 +341,7 @@ async function bdRun() {
       BD.decodeSecs.push(r.decodeSecs || 0);
       if (BD.stopping) break;
       bdDecodeAhead(item);
-      if (!BD.worker) await bdStartWorker();             // a worker that died on the last frame
+      if (!BD.worker || (BD.mode === 'page' && !BD.pageSess)) await bdStartWorker();   // a worker that died on the last frame
       const meta = Object.assign({}, r.meta || {});
       if (r.exif) meta.exif = r.exif;
       const out = await bdDenoiseFrame({
@@ -337,6 +418,7 @@ function bdPause(on) {
   BD.paused = on;
   if (BD.worker) BD.worker.postMessage({ type: on ? 'pause' : 'resume' });
   if (!on && BD.wake) { BD.wake(); BD.wake = null; }
+  if (!on && BD.pageWake) { BD.pageWake(); BD.pageWake = null; }
   bdPill();
 }
 
@@ -344,6 +426,7 @@ function bdStop() {
   BD.stopping = true;
   BD.paused = false;
   if (BD.wake) { BD.wake(); BD.wake = null; }
+  if (BD.pageWake) { BD.pageWake(); BD.pageWake = null; }
   bdCancelDecodes();
   bdStopWorker();
   for (const it of BD.items) if (it.status === 'queued' || it.status === 'working') bdSet(it, 'stopped');
