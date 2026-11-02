@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('native', {
   pickCullOut: () => ipcRenderer.invoke('dialog:cullOut'),
   cullMove: (items) => ipcRenderer.invoke('cull:move', items),
   denoiseCommit: (raw, bytes) => ipcRenderer.invoke('denoise:commit', { raw, bytes }),
+  keepAwake: (on) => ipcRenderer.invoke('power:keepAwake', !!on),
   decodedHas: (paths) => ipcRenderer.invoke('decoded:has', paths),
   decodedGet: (path) => ipcRenderer.invoke('decoded:get', path),
   decodedPut: (path, bytes) => ipcRenderer.invoke('decoded:put', { path, bytes }),

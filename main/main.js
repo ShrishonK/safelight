@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell, nativeTheme } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, shell, nativeTheme, powerSaveBlocker } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -377,6 +377,14 @@ ipcMain.handle('denoise:commit', async (_e, { raw, bytes }) => {
     if (tmp) await fs.promises.unlink(tmp).catch(() => { });
     return { ok: false, error: moveTrouble(e) };
   }
+});
+
+/* a batch denoise keeps the computer from sleeping: sleep stops the GPU and can lose it */
+let _awake = null;
+ipcMain.handle('power:keepAwake', (_e, on) => {
+  if (on && _awake == null) _awake = powerSaveBlocker.start('prevent-app-suspension');
+  if (!on && _awake != null) { powerSaveBlocker.stop(_awake); _awake = null; }
+  return _awake != null;
 });
 
 ipcMain.handle('asset:read', (_e, rel) => {

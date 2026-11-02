@@ -43,7 +43,17 @@ const DNC = (() => {
     return w;
   }
 
-  /* ctx: { ort, session, backend, overlap, tile, progress(f), checkpoint() }
+  /* a run that never answers (a lost GPU device does exactly that) is turned into an error */
+  function withTimeout(p, ms) {
+    if (!ms) return p;
+    let t;
+    return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(Object.assign(new Error('the GPU stopped responding'), { stalled: true })), ms); })])
+      .finally(() => clearTimeout(t));
+  }
+
+  /* ctx: { ort, session, backend, overlap, tile, progress(f), checkpoint(),
+            F32/U16: typed-array constructors of the runtime's own frame (optional),
+            timeoutMs(tileIndex, tileTimes): longest a tile may take (optional) }
      src: Float32Array, gamma-encoded RGB 0..1 interleaved, W*H*3 */
   async function runTiles(ctx, src, W, H, tile) {
     const { ort, session: sess } = ctx;
@@ -62,7 +72,9 @@ const DNC = (() => {
     const xs = starts(W), ys = starts(H);
     const acc = new Float32Array(W * H * 3), wsum = new Float32Array(W * H);
     const total = xs.length * ys.length, plane = T * T, fw = feather(T, OV);
-    const inF = new Float32Array(3 * plane), inH = half ? new Uint16Array(3 * plane) : null;
+    const F32 = ctx.F32 || Float32Array, U16 = ctx.U16 || Uint16Array;
+    const inF = new F32(3 * plane), inH = half ? new U16(3 * plane) : null;
+    const times = ctx.tileTimes || (ctx.tileTimes = []);
     let done = 0;
 
     for (const y0 of ys) {
@@ -81,8 +93,11 @@ const DNC = (() => {
         if (half) { for (let i = 0; i < inF.length; i++) inH[i] = toHalf(inF[i]); input = new ort.Tensor('float16', inH, [1, 3, T, T]); }
         else input = new ort.Tensor('float32', inF, [1, 3, T, T]);
         let res;
-        try { res = await sess.run({ [inName]: input }); }
-        catch (e) { if (done === 0) e.firstTile = true; throw e; }
+        const t0 = performance.now();
+        try { res = await withTimeout(sess.run({ [inName]: input }), ctx.timeoutMs ? ctx.timeoutMs(done, times) : 0); }
+        catch (e) { if (done === 0 && !e.stalled) e.firstTile = true; throw e; }
+        times.push(performance.now() - t0);
+        if (times.length > 200) times.shift();
         const tensor = res[outName];
         if (tensor.dims.length === 4 && tensor.dims[1] === 1) {
           throw new Error('that model outputs a single-channel mask, not a photo — it is a segmentation model, not a denoiser');

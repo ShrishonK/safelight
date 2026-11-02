@@ -126,7 +126,9 @@ denoised file sits at the raw's own exposure, so a look you made on the raw fits
 photo you are editing when its turn comes just gets cleaner pixels under your sliders. A small pill
 in the corner of the photo shows which frame is running, how far along it is and roughly how long is
 left, with pause and stop; queued frames carry a **DN** badge in the filmstrip. Stopping keeps
-whatever is already finished. Pressing the button again later picks up the raws still left. Before a
+whatever is already finished. While a batch runs the computer is kept from sleeping, and if the
+GPU stops answering (a driver reset, a lost device) the GPU runtime is rebuilt and the photo in
+progress starts again — hover the pill to see which GPU it's on and whether that has happened. Pressing the button again later picks up the raws still left. Before a
 frame goes through the network it is lifted to the exposure you edit it at (or to a typical
 mid-grey if it is unedited), so the model sees the noise as you will; highlights that lift would clip
 keep their original pixels. On a machine with two GPUs WebGPU picks the high-performance one.
@@ -185,6 +187,7 @@ renderer/cull.js     Cull mode: flags, file-type filter, moving the keepers to a
 renderer/rawcache.js      decoding a folder's raws in the background, and the on-disk cache of decodes
 renderer/batchdenoise.js  Denoise all: the background queue, the status pill, swapping raws for .fedr
 renderer/denoisecore.js   the tiled network pass, shared by the page (GPU) and the denoise worker
+renderer/gpuhost.js       the batch's GPU runtime in a frame of its own, rebuilt if the GPU is lost
 renderer/denoiseworker.js the neural denoiser in a worker, so a long batch never blocks the interface
 renderer/fedrworker.js    unpacks compressed .fedr files off the interface thread
 renderer/vendor/     dcraw compiled to JavaScript (patched; see the note at the top of dcraw.js)

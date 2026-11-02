@@ -24,6 +24,7 @@ const BD = {
   running: false, paused: false, stopping: false,
   worker: null, ready: null, label: '',
   cur: null, frac: 0, secs: [], decodeSecs: [], waitSecs: [], saveSecs: [], lastStats: '',
+  doneAt: [], runStart: 0, tileTimes: [], recoveries: 0, gpuInfo: '', restarting: false, rec: null,
   opts: { strength: 1, device: 'auto', model: null },
   doneCount: 0, failed: [], started: 0,
   decodes: new Map(),     // item -> decode in flight
@@ -54,37 +55,25 @@ async function bdModelRecord(key) {
   return { key, main: rec.main, ext: rec.ext || [] };
 }
 
-/* A GPU session on the page itself. WebGPU from the page is the path the
-   one-photo denoise has always used; from a worker it can quietly end up on
-   the CPU instead. Only a session that really came up on WebGPU is kept. */
-async function bdPageSession(rec) {
-  if (BD.opts.device === 'cpu') return null;
-  try {
-    if (!(await haveWebGPU())) return null;
-    const ort = await ensureOrt();
-    const opts = { executionProviders: ['webgpu'], graphOptimizationLevel: 'all' };
-    if (rec.ext && rec.ext.length) opts.externalData = rec.ext.map(e => ({ path: e.path, data: e.data }));
-    const sess = await ort.InferenceSession.create(rec.main, opts);
-    if (!webgpuLive(ort)) { await sess.release().catch(() => { }); return null; }
-    return sess;
-  } catch (e) {
-    console.warn('batch denoise: no GPU session on the page, trying the worker', e);
-    return null;
-  }
+/* The GPU runtime lives in its own frame (gpuhost.js) so it can be rebuilt if
+   the GPU is lost mid-batch. Only a session that really came up on WebGPU counts. */
+async function bdGpuHost(rec) {
+  if (BD.opts.device === 'cpu') return false;
+  try { await ghCreate(rec); return true; }
+  catch (e) { console.warn('batch denoise: no GPU runtime, using the worker instead —', e && e.message); return false; }
 }
 
 function bdStartWorker() {
   if (BD.ready) return BD.ready;
   BD.ready = (async () => {
-    const rec = await bdModelRecord(BD.opts.model);
-    BD.pageSess = BD.pageSess || await bdPageSession(rec);
-    if (BD.pageSess) {
+    const rec = BD.rec || (BD.rec = await bdModelRecord(BD.opts.model));
+    if (ghAlive() || await bdGpuHost(rec)) {
       // the network runs here on the GPU; the worker only does the per-pixel work around it
       const w = new Worker('denoiseworker.js');
-      BD.worker = w; BD.mode = 'page'; BD.label = 'GPU';
+      BD.worker = w; BD.mode = 'page'; BD.label = 'GPU'; BD.gpuInfo = GH.info;
       w.onmessage = e => bdOnMessage(e.data);
       w.onerror = ev => { ev.preventDefault(); bdWorkerDied(ev.message || 'the denoise worker stopped'); };
-      console.log('batch denoise: network on the GPU (WebGPU, page)');
+      console.log('batch denoise: network on the GPU' + (GH.info ? ' (' + GH.info + ')' : ''));
       return w;
     }
     BD.mode = 'worker';
@@ -127,16 +116,10 @@ function bdStopWorker() {
   if (BD.worker) BD.worker.terminate();
   BD.worker = null; BD.ready = null;
   if (BD.pending) { BD.pending.reject(new Error('cancelled')); BD.pending = null; }
-  bdReleasePage();
-}
-
-/* the page session is let go only once no tile is in flight on it */
-function bdReleasePage() {
-  if (!BD.pageSess) return;
-  if (BD.pageBusy) { BD.releaseAfter = true; return; }
-  const s = BD.pageSess;
-  BD.pageSess = null; BD.releaseAfter = false;
-  s.release().catch(() => { });
+  BD.rec = null;
+  // a tile in flight on the GPU finishes first (a second or two); tearing the
+  // runtime down under it would leave that run waiting forever
+  if (BD.pageBusy) BD.destroyAfter = true; else ghDestroy();
 }
 
 function bdWorkerDied(msg) {
@@ -156,10 +139,14 @@ function bdOnMessage(d) {
 }
 
 let _bdSeq = 0;
+/* the worker's half of a frame takes seconds; one that never answers is treated as dead */
 function bdAsk(msg, transfer) {
   return new Promise((resolve, reject) => {
     if (!BD.worker) { reject(new Error('cancelled')); return; }
-    BD.pending = { id: msg.id, resolve, reject };
+    const t = setTimeout(() => {
+      if (BD.pending && BD.pending.id === msg.id) bdWorkerDied('the denoise worker stopped responding');
+    }, 5 * 60 * 1000);
+    BD.pending = { id: msg.id, resolve: v => { clearTimeout(t); resolve(v); }, reject: e => { clearTimeout(t); reject(e); } };
     BD.worker.postMessage(msg, transfer);
   });
 }
@@ -167,28 +154,65 @@ function bdAsk(msg, transfer) {
 async function bdCheckpoint() {
   await new Promise(r => setTimeout(r, 0));
   while (BD.paused && !BD.stopping) await new Promise(r => { BD.pageWake = r; });
-  if (BD.stopping || !BD.pageSess) throw new Error('cancelled');
+  if (BD.stopping) throw new Error('cancelled');
+  if (GH.lost) throw Object.assign(new Error('the GPU was lost'), { stalled: true });
+}
+
+/* How long one tile may take before the GPU counts as stuck. The first tile of a
+   session compiles the network's shaders and can take a minute; after that a
+   tile takes about as long as the ones before it. */
+function bdTileTimeout(i, times) {
+  if (!times.length) return 5 * 60 * 1000;
+  const sorted = times.slice().sort((a, b) => a - b);
+  const median = sorted[sorted.length >> 1];
+  return Math.min(5 * 60 * 1000, Math.max(60 * 1000, median * 15));
 }
 
 /* the GPU path: prepare in the worker, run the network here, finish in the worker */
 async function bdDenoisePage(frame) {
   const id = ++_bdSeq;
   const prepped = await bdAsk({ type: 'prep', id, rgba: frame.rgba, w: frame.w, h: frame.h, exposure: frame.exposure }, [frame.rgba]);
-  BD.pageBusy = true;
+  const src = prepped.src instanceof Float32Array ? prepped.src : new Float32Array(prepped.src);
   let out, secs;
-  try {
+  for (let attempt = 1; ; attempt++) {
+    if (!ghAlive()) {
+      // the GPU was lost on an earlier frame or tile: build a fresh runtime before going on
+      BD.restarting = true; bdPill();
+      try { await ghCreate(BD.rec || (BD.rec = await bdModelRecord(BD.opts.model))); }
+      catch (e) { throw Object.assign(new Error('the GPU could not be restarted (' + (e && e.message) + ')'), { fatal: true }); }
+      finally { BD.restarting = false; }
+      BD.gpuInfo = GH.info;
+    }
     const ctx = {
-      ort: AI.ort, session: BD.pageSess, backend: 'webgpu', overlap: 96, tile: BD.tile || 0,
+      ort: GH.ort, session: GH.session, backend: GH_PROVIDERS[0], overlap: 96, tile: BD.tile || 0,
+      F32: GH.win.Float32Array, U16: GH.win.Uint16Array,
+      tileTimes: BD.tileTimes, timeoutMs: bdTileTimeout,
       progress: f => { BD.frac = f; bdPill(); },
       checkpoint: bdCheckpoint
     };
-    const t0 = performance.now();
-    out = await DNC.runModel(ctx, new Float32Array(prepped.src.buffer || prepped.src), frame.w, frame.h);
-    BD.tile = ctx.tile;
-    secs = (performance.now() - t0) / 1000;
-  } finally {
-    BD.pageBusy = false;
-    if (BD.releaseAfter) bdReleasePage();
+    BD.pageBusy = true;
+    try {
+      const t0 = performance.now();
+      out = await DNC.runModel(ctx, src, frame.w, frame.h);
+      BD.tile = ctx.tile; BD.tileTimes = ctx.tileTimes;
+      secs = (performance.now() - t0) / 1000;
+      break;
+    } catch (e) {
+      BD.pageBusy = false;
+      if (BD.destroyAfter) { BD.destroyAfter = false; ghDestroy(); }
+      if (String(e && e.message) === 'cancelled' || BD.stopping) throw new Error('cancelled');
+      const gpuTrouble = e.stalled || GH.lost || /device|lost|gpu|webgpu|dxgi|d3d/i.test(String(e && e.message));
+      if (!gpuTrouble || attempt >= 3) throw e;
+      // start this frame again on a new GPU runtime; the tiles already done can't be trusted
+      console.warn(`batch denoise: ${e.message} — rebuilding the GPU runtime (attempt ${attempt + 1} of 3)`);
+      BD.recoveries = (BD.recoveries || 0) + 1;
+      BD.tileTimes = [];
+      ghDestroy();
+      BD.frac = 0;
+    } finally {
+      BD.pageBusy = false;
+      if (BD.destroyAfter) { BD.destroyAfter = false; ghDestroy(); }
+    }
   }
   const rgba = prepped.rgba.buffer || prepped.rgba;
   const fin = await bdAsk(Object.assign({}, frame, { type: 'finish', id: ++_bdSeq, rgba, out: out.buffer, gain: prepped.gain, secs, device: 'GPU' }), [rgba, out.buffer]);
@@ -196,7 +220,7 @@ async function bdDenoisePage(frame) {
 }
 
 function bdDenoiseFrame(frame) {
-  if (BD.mode === 'page' && BD.pageSess) return bdDenoisePage(frame);
+  if (BD.mode === 'page') return bdDenoisePage(frame);
   return new Promise((resolve, reject) => {
     BD.pending = { id: ++_bdSeq, resolve, reject };
     BD.worker.postMessage(Object.assign({ type: 'frame', id: BD.pending.id }, frame), [frame.rgba]);
@@ -257,6 +281,7 @@ async function bdSave(item, out, w, h) {
     const res = await N.denoiseCommit(item.raw, packed.file);
     if (!res || !res.ok) throw new Error(res ? res.error : 'could not write the denoised file');
     BD.doneCount++;
+    BD.doneAt.push(Date.now());
     bdSet(item, 'done');
     bdSwapped(item.raw, res.fedr, res.original, { w, h, rgba: packed.rgba.buffer });
     BD.saveSecs.push((performance.now() - t0) / 1000);
@@ -292,12 +317,16 @@ function bdSet(item, status) {
 async function bdRun() {
   if (BD.running) return;
   BD.running = true; BD.stopping = false;
+  // a sleeping computer stops the GPU, and can lose it altogether
+  if (N.keepAwake) N.keepAwake(true);
   BD.started = BD.started || Date.now();
+  BD.runStart = Date.now(); BD.doneAt = []; BD.recoveries = 0;
   bdPill();
   try {
     await bdStartWorker();
   } catch (e) {
     BD.running = false;
+    if (N.keepAwake) N.keepAwake(false);
     bdClear();
     showError('Batch denoise could not start', [String(e.message)]);
     return;
@@ -323,7 +352,7 @@ async function bdRun() {
       BD.decodeSecs.push(r.decodeSecs || 0);
       if (BD.stopping) break;
       bdDecodeAhead(item);
-      if (!BD.worker || (BD.mode === 'page' && !BD.pageSess)) await bdStartWorker();   // a worker that died on the last frame
+      if (!BD.worker) await bdStartWorker();             // a worker that died on the last frame
       const meta = Object.assign({}, r.meta || {});
       if (r.exif) meta.exif = r.exif;
       const out = await bdDenoiseFrame({
@@ -346,6 +375,8 @@ async function bdRun() {
       item.error = String(e && e.message || e);
       BD.failed.push(item);
       bdSet(item, 'failed');
+      // no GPU to come back to: stop here rather than fail every photo left
+      if (e && e.fatal) { BD.stopping = true; for (const it of BD.items) if (it.status === 'queued') bdSet(it, 'stopped'); break; }
     }
     BD.cur = null; BD.frac = 0;
     bdPill();
@@ -356,6 +387,7 @@ async function bdRun() {
   bdPill();
   await saving;                         // a finished frame still gets written, even after Stop
   BD.running = false;
+  if (N.keepAwake) N.keepAwake(false);
   bdFinished();
 }
 
@@ -430,7 +462,7 @@ function bdFinished() {
   const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
   const each = done ? (Date.now() - BD.started) / 1000 / done : 0;
   // where the time went, per photo — hover the pill to see it
-  BD.lastStats = done ? `~${Math.round(each)}s per photo on ${BD.label || '?'} · denoise ${avg(BD.secs).toFixed(0)}s, ` +
+  BD.lastStats = done ? `~${Math.round(each)}s per photo on ${BD.label || '?'}${BD.gpuInfo ? ' (' + BD.gpuInfo + ')' : ''}${BD.recoveries ? `, GPU restarted ${BD.recoveries}×` : ''} · denoise ${avg(BD.secs).toFixed(0)}s, ` +
     `raw decode ${avg(BD.decodeSecs).toFixed(0)}s (waited ${avg(BD.waitSecs).toFixed(0)}s), saving ${avg(BD.saveSecs).toFixed(0)}s` : '';
   if (BD.lastStats) console.log('batch denoise:', BD.lastStats);
   BD.items = []; BD.secs = []; BD.decodeSecs = []; BD.waitSecs = []; BD.saveSecs = []; BD.doneCount = 0; BD.started = 0;
@@ -557,14 +589,18 @@ function bdPill(finalMsg) {
   else if (BD.cur) msg = `Denoise ${pos}/${total} · ${BD.cur.name} · ${Math.round(BD.frac * 100)}%`;
   else msg = `Denoise ${finished}/${total}`;
   if (BD.label && !BD.paused) msg += ' · ' + (BD.label === 'GPU' ? 'GPU' : 'CPU');
-  if (BD.secs.length && !BD.paused) {
-    const avg = BD.secs.reduce((a, b) => a + b, 0) / BD.secs.length;
-    const left = (total - finished - BD.frac) * avg;
+  if (BD.restarting) msg = `Denoise ${pos}/${total} · GPU stopped responding — restarting it`;
+  else if (BD.doneAt.length && !BD.paused) {
+    // wall-clock time per finished photo, over the last few, not just the network's share of it
+    const recent = BD.doneAt.slice(-6), span = recent.length > 1 ? (recent[recent.length - 1] - recent[0]) / (recent.length - 1) : (recent[0] - BD.runStart);
+    const per = span / 1000;
+    const since = (Date.now() - BD.doneAt[BD.doneAt.length - 1]) / 1000;
+    const left = Math.max(0, (total - finished) * per - since);
     if (left > 5) msg += ` · ~${bdFmtMins(left)} left`;
   }
   if (BD.failed.length) msg += ` · ${BD.failed.length} failed`;
   t.textContent = msg;
-  pill.title = BD.label ? 'Running on ' + BD.label + (BD.secs.length ? ` · last frame: denoise ${BD.secs[BD.secs.length - 1].toFixed(0)}s, raw decode ${BD.decodeSecs[BD.decodeSecs.length - 1].toFixed(0)}s` : '') : '';
+  pill.title = BD.label ? 'Running on ' + BD.label + (BD.gpuInfo ? ' (' + BD.gpuInfo + ')' : '') + (BD.recoveries ? ` · GPU restarted ${BD.recoveries}×` : '') + (BD.secs.length ? ` · last frame: denoise ${BD.secs[BD.secs.length - 1].toFixed(0)}s, raw decode ${BD.decodeSecs[BD.decodeSecs.length - 1].toFixed(0)}s` : '') : '';
   bar.style.width = (100 * (finished + BD.frac) / total).toFixed(1) + '%';
 }
 
