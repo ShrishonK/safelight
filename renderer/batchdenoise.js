@@ -23,13 +23,12 @@ const BD = {
   state: new Map(),       // raw path -> status, for the filmstrip badges
   running: false, paused: false, stopping: false,
   worker: null, ready: null, label: '',
-  cur: null, frac: 0, secs: [],
+  cur: null, frac: 0, secs: [], decodeSecs: [], waitSecs: [], saveSecs: [], lastStats: '',
   opts: { strength: 1, device: 'auto', model: null },
   doneCount: 0, failed: [], started: 0,
-  nextDecode: null,
+  decodes: new Map(),     // item -> decode in flight
   hideTimer: 0
 };
-const BD_PRIO = 40;            // behind the photo on screen and its neighbours
 
 const bdBase = p => p.split(/[\\/]/).pop();
 const bdStem = n => n.replace(/\.[^.]+$/, '');
@@ -63,14 +62,13 @@ function bdStartWorker() {
     let wasmPaths = base, threads = 1;
     const cores = navigator.hardwareConcurrency || 2;
     // the same blob trick as ai.js: the threaded runtime can't fetch its module from file://
-    if (typeof SharedArrayBuffer !== 'undefined' && cores > 3) {
+    if (typeof SharedArrayBuffer !== 'undefined' && cores > 2) {
       try {
         const r = await N.readAsset('vendor/ort/ort-wasm-simd-threaded.jsep.mjs');
         if (r && r.bytes) {
           const mjs = URL.createObjectURL(new Blob([r.bytes], { type: 'text/javascript' }));
           wasmPaths = { mjs, wasm: base + 'ort-wasm-simd-threaded.jsep.wasm' };
-          // leave cores for the interface, the raw decoder and the GPU driver
-          threads = Math.max(1, Math.min(6, cores - 3));
+          threads = Math.min(8, cores - 2);              // as many as the one-photo denoise uses
         }
       } catch (e) { console.warn('batch denoise: threaded runtime unavailable', e); }
     }
@@ -125,16 +123,87 @@ function bdDenoiseFrame(frame) {
   });
 }
 
-/* ---------- decoding ---------- */
+/* ---------- decoding ----------
+   The batch decodes in a raw worker of its own rather than through the app's
+   shared queue. In that queue the photo you click on takes a busy decoder from
+   background work and the background job starts over, so editing while a batch
+   ran kept throwing away 20-30 s decodes. Here nothing can bump it. */
 function bdDecode(item) {
-  let exif = null;
-  const job = rawJob({ path: item.raw, half: false, prio: BD_PRIO, onBytes: b => {
-    try { exif = typeof parseExif === 'function' ? parseExif(new Uint8Array(b).subarray(0, 384 * 1024)) : null; } catch { exif = null; }
-  } });
-  const p = job.promise.then(r => Object.assign(r, { exif }));
-  p.job = job;
-  p.catch(() => { });
+  let worker = null, cancelled = false;
+  const p = (async () => {
+    const t0 = performance.now();
+    const [f] = await N.readFiles([item.raw]);
+    if (!f) throw new Error('could not read the file');
+    if (cancelled) throw new Error('cancelled');
+    let exif = null;
+    try { exif = typeof parseExif === 'function' ? parseExif(new Uint8Array(f.bytes).subarray(0, 384 * 1024)) : null; } catch { exif = null; }
+    const buf = standalone(f.bytes);
+    const r = await new Promise((res, rej) => {
+      worker = new Worker('rawworker.js');
+      worker.onmessage = e => e.data.ok ? res(e.data) : rej(new Error(e.data.error));
+      worker.onerror = ev => { ev.preventDefault(); rej(new Error(ev.message || 'the raw decoder stopped')); };
+      worker.postMessage({ id: 1, bytes: buf, half: false, maxTex: maxTexture(), skipIdentify: false }, [buf]);
+    });
+    if (worker) worker.terminate();          // hands the decoder's heap straight back
+    worker = null;
+    if (cancelled) throw new Error('cancelled');
+    return Object.assign(r, { exif, decodeSecs: (performance.now() - t0) / 1000 });
+  })();
+  p.cancel = () => { cancelled = true; if (worker) worker.terminate(); worker = null; };
+  p.catch(() => { if (worker) worker.terminate(); });
   return p;
+}
+
+/* A raw takes ~20-30 s to decode, often as long as the network takes on a GPU.
+   On a desktop the next two are decoded while one denoises, so the GPU never
+   waits; a smaller machine keeps one ahead to stay within its memory. */
+const BD_AHEAD = (navigator.hardwareConcurrency || 4) >= 6 && (navigator.deviceMemory || 4) >= 8 ? 2 : 1;
+function bdDecodeAhead(item) {
+  if (!BD.decodes.has(item)) BD.decodes.set(item, bdDecode(item));
+  if (BD.paused) return;
+  let n = 0;
+  for (const it of BD.items) {
+    if (it === item || it.status !== 'queued') continue;
+    if (n++ >= BD_AHEAD) break;
+    if (!BD.decodes.has(it)) BD.decodes.set(it, bdDecode(it));
+  }
+}
+function bdCancelDecodes() {
+  for (const p of BD.decodes.values()) p.cancel();
+  BD.decodes.clear();
+}
+
+/* ---------- saving ----------
+   Packing a frame and writing it run beside the next frame's denoise. */
+function bdEncode(head, rgba) {
+  return new Promise((res, rej) => {
+    const w = new Worker('fedrworker.js');
+    w.onmessage = e => { w.terminate(); e.data.ok ? res(e.data) : rej(new Error(e.data.error)); };
+    w.onerror = ev => { ev.preventDefault(); w.terminate(); rej(new Error(ev.message || 'could not pack the file')); };
+    w.postMessage({ type: 'encode', head, rgba: rgba.buffer }, [rgba.buffer]);
+  });
+}
+
+async function bdSave(item, out, w, h) {
+  const t0 = performance.now();
+  try {
+    const packed = await bdEncode(out.head, new Uint16Array(out.rgba));
+    // whatever was just changed on this photo is on disk before its record moves
+    const live = PHOTOS.get(item.raw);
+    if (live) persistNow(live);
+    const res = await N.denoiseCommit(item.raw, packed.file);
+    if (!res || !res.ok) throw new Error(res ? res.error : 'could not write the denoised file');
+    BD.doneCount++;
+    bdSet(item, 'done');
+    bdSwapped(item.raw, res.fedr, res.original, { w, h, rgba: packed.rgba.buffer });
+    BD.saveSecs.push((performance.now() - t0) / 1000);
+  } catch (e) {
+    console.error('batch denoise: saving failed', item.raw, e);
+    item.error = String(e && e.message || e);
+    BD.failed.push(item);
+    bdSet(item, 'failed');
+  }
+  bdPill();
 }
 
 /* the exposure the photo is being edited at, so the network sees the noise as you will */
@@ -171,6 +240,7 @@ async function bdRun() {
     return;
   }
   bdPill();
+  let saving = Promise.resolve();
   while (!BD.stopping) {
     while (BD.paused && !BD.stopping) await new Promise(r => { BD.wake = r; });
     if (BD.stopping) break;
@@ -180,13 +250,16 @@ async function bdRun() {
     bdSet(item, 'working');
     bdPill();
     try {
-      // the decode for this one was usually started while the last one was denoising
-      const dec = BD.nextDecode && BD.nextDecode.item === item ? BD.nextDecode.p : bdDecode(item);
-      BD.nextDecode = null;
+      // the decode for this one was usually started while earlier ones were denoising
+      bdDecodeAhead(item);
+      const dec = BD.decodes.get(item);
+      const tw = performance.now();
       const r = await dec;
+      BD.decodes.delete(item);
+      BD.waitSecs.push((performance.now() - tw) / 1000);
+      BD.decodeSecs.push(r.decodeSecs || 0);
       if (BD.stopping) break;
-      const following = bdNext(item);
-      if (following && !BD.paused) BD.nextDecode = { item: following, p: bdDecode(following) };
+      bdDecodeAhead(item);
       if (!BD.worker) await bdStartWorker();             // a worker that died on the last frame
       const meta = Object.assign({}, r.meta || {});
       if (r.exif) meta.exif = r.exif;
@@ -197,16 +270,13 @@ async function bdRun() {
         strength: BD.opts.strength, model: BD.opts.model || BUILTIN_DENOISE
       });
       r.rgba = null;
-      if (BD.stopping) break;
-      // whatever was just changed on this photo is on disk before its record moves
-      const live = PHOTOS.get(item.raw);
-      if (live) persistNow(live);
-      const res = await N.denoiseCommit(item.raw, out.file);
-      if (!res || !res.ok) throw new Error(res ? res.error : 'could not write the denoised file');
       BD.secs.push(out.secs);
-      BD.doneCount++;
-      bdSet(item, 'done');
-      bdSwapped(item.raw, res.fedr, res.original, { w: r.w, h: r.h, rgba: out.rgba });
+      console.log(`batch denoise: ${item.name} · decode ${(r.decodeSecs || 0).toFixed(1)}s (waited ${BD.waitSecs[BD.waitSecs.length - 1].toFixed(1)}s) · denoise ${out.secs.toFixed(1)}s on ${BD.label}`);
+      // the next frame starts denoising while this one is packed and written;
+      // only one waits to be written at a time, to keep memory in check
+      await saving;
+      saving = bdSave(item, out, r.w, r.h);
+      if (BD.stopping) break;
     } catch (e) {
       if (String(e && e.message) === 'cancelled' || BD.stopping) break;
       console.error('batch denoise failed', item.raw, e);
@@ -217,10 +287,12 @@ async function bdRun() {
     BD.cur = null; BD.frac = 0;
     bdPill();
   }
-  BD.running = false;
   BD.cur = null;
-  if (BD.nextDecode) { BD.nextDecode.p.job.cancel(); BD.nextDecode = null; }
+  bdCancelDecodes();
   bdStopWorker();
+  bdPill();
+  await saving;                         // a finished frame still gets written, even after Stop
+  BD.running = false;
   bdFinished();
 }
 
@@ -272,7 +344,7 @@ function bdStop() {
   BD.stopping = true;
   BD.paused = false;
   if (BD.wake) { BD.wake(); BD.wake = null; }
-  if (BD.nextDecode) { BD.nextDecode.p.job.cancel(); BD.nextDecode = null; }
+  bdCancelDecodes();
   bdStopWorker();
   for (const it of BD.items) if (it.status === 'queued' || it.status === 'working') bdSet(it, 'stopped');
   if (!BD.running) bdFinished();
@@ -280,7 +352,8 @@ function bdStop() {
 
 function bdClear() {
   for (const p of [...BD.state.keys()]) { BD.state.delete(p); bdBadge(p); }
-  BD.items = []; BD.secs = []; BD.failed = []; BD.doneCount = 0; BD.started = 0;
+  BD.items = []; BD.secs = []; BD.decodeSecs = []; BD.waitSecs = []; BD.saveSecs = [];
+  BD.failed = []; BD.doneCount = 0; BD.started = 0;
   BD.paused = false; BD.stopping = false;
   bdPill();
 }
@@ -289,13 +362,20 @@ function bdFinished() {
   const done = BD.doneCount, failed = BD.failed.slice(), stopped = BD.stopping;
   const left = BD.items.filter(it => it.status === 'stopped').length;
   const mins = BD.started ? Math.round((Date.now() - BD.started) / 60000) : 0;
-  BD.items = []; BD.secs = []; BD.doneCount = 0; BD.started = 0;
+  const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+  const each = done ? (Date.now() - BD.started) / 1000 / done : 0;
+  // where the time went, per photo — hover the pill to see it
+  BD.lastStats = done ? `~${Math.round(each)}s per photo on ${BD.label || '?'} · denoise ${avg(BD.secs).toFixed(0)}s, ` +
+    `raw decode ${avg(BD.decodeSecs).toFixed(0)}s (waited ${avg(BD.waitSecs).toFixed(0)}s), saving ${avg(BD.saveSecs).toFixed(0)}s` : '';
+  if (BD.lastStats) console.log('batch denoise:', BD.lastStats);
+  BD.items = []; BD.secs = []; BD.decodeSecs = []; BD.waitSecs = []; BD.saveSecs = []; BD.doneCount = 0; BD.started = 0;
   BD.paused = false; BD.stopping = false;
   for (const p of [...BD.state.keys()]) { BD.state.delete(p); bdBadge(p); }
   BD.failed = failed;
   let msg = stopped
     ? `Stopped · ${done} denoised, ${left} left as they were`
     : `Denoised ${done} photo${done === 1 ? '' : 's'}${mins ? ` in ${mins} min` : ''}`;
+  if (done && each) msg += ` · ~${Math.round(each)}s each on ${BD.label === 'GPU' ? 'GPU' : 'CPU'}`;
   if (failed.length) msg += ` · ${failed.length} failed`;
   bdPill(msg);
 }
@@ -389,7 +469,7 @@ function bdPill(finalMsg) {
     bar.style.width = '100%';
     pause.hidden = true;
     stop.textContent = '×'; stop.title = 'Dismiss';
-    pill.title = BD.failed.length ? 'Click to see what failed' : '';
+    pill.title = (BD.lastStats || '') + (BD.failed.length ? (BD.lastStats ? '\n' : '') + 'Click to see what failed' : '');
     if (!BD.failed.length) BD.hideTimer = setTimeout(() => { pill.hidden = true; }, 8000);
     return;
   }
@@ -408,7 +488,7 @@ function bdPill(finalMsg) {
   let msg;
   if (!BD.worker && !BD.label) msg = 'Starting denoise…';
   else if (BD.paused) msg = `Paused · ${finished} of ${total} done`;
-  else if (BD.cur && BD.frac === 0) msg = `Denoise ${pos}/${total} · reading ${BD.cur.name}`;
+  else if (BD.cur && BD.frac === 0) msg = `Denoise ${pos}/${total} · decoding ${BD.cur.name}`;
   else if (BD.cur) msg = `Denoise ${pos}/${total} · ${BD.cur.name} · ${Math.round(BD.frac * 100)}%`;
   else msg = `Denoise ${finished}/${total}`;
   if (BD.label && !BD.paused) msg += ' · ' + (BD.label === 'GPU' ? 'GPU' : 'CPU');
@@ -419,7 +499,7 @@ function bdPill(finalMsg) {
   }
   if (BD.failed.length) msg += ` · ${BD.failed.length} failed`;
   t.textContent = msg;
-  pill.title = BD.label ? 'Running on ' + BD.label : '';
+  pill.title = BD.label ? 'Running on ' + BD.label + (BD.secs.length ? ` · last frame: denoise ${BD.secs[BD.secs.length - 1].toFixed(0)}s, raw decode ${BD.decodeSecs[BD.decodeSecs.length - 1].toFixed(0)}s` : '') : '';
   bar.style.width = (100 * (finished + BD.frac) / total).toFixed(1) + '%';
 }
 

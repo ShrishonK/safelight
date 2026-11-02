@@ -207,17 +207,27 @@ function chooseGain(rgba, n, exposure) {
   return med > 0 ? Math.min(16, Math.max(1, 0.12 / med)) : 16;
 }
 
+/* sRGB code value (16-bit) -> linear, for the way back out */
+let _dec = null;
+function DEC() {
+  if (_dec) return _dec;
+  _dec = new Float32Array(65536);
+  for (let i = 0; i < 65536; i++) _dec[i] = decSRGB(i / 65535);
+  return _dec;
+}
+
 async function denoiseFrame(d) {
   const { w: W, h: H, strength } = d;
   const rgba = new Uint16Array(d.rgba);
   const n = W * H, h2f = H2F();
   const gain = chooseGain(rgba, n, d.exposure);
 
+  // every half float maps to one input value at this gain: a table, not 70 M pow() calls
+  const enc = new Float32Array(65536);
+  for (let i = 0; i < 65536; i++) { const v = h2f[i] * gain; enc[i] = Number.isFinite(v) ? clamp01(encSRGB(v > 0 ? v : 0)) : 0; }
   let src = new Float32Array(n * 3);
   for (let i = 0, p = 0, q = 0; i < n; i++, p += 3, q += 4) {
-    src[p] = clamp01(encSRGB(h2f[rgba[q]] * gain));
-    src[p + 1] = clamp01(encSRGB(h2f[rgba[q + 1]] * gain));
-    src[p + 2] = clamp01(encSRGB(h2f[rgba[q + 2]] * gain));
+    src[p] = enc[rgba[q]]; src[p + 1] = enc[rgba[q + 1]]; src[p + 2] = enc[rgba[q + 2]];
   }
   const t0 = performance.now();
   let out = await runModel(src, W, H, f => self.postMessage({ type: 'progress', id: d.id, f }));
@@ -226,45 +236,28 @@ async function denoiseFrame(d) {
 
   // back to linear at the raw's own level, into the frame we were given
   const k = Math.max(0, Math.min(1, strength == null ? 1 : strength));
+  const dec = DEC(), ig = 1 / gain;
+  const back = v => dec[v <= 0 ? 0 : v >= 1 ? 65535 : (v * 65535 + 0.5) | 0] * ig;
   for (let i = 0, p = 0, q = 0; i < n; i++, p += 3, q += 4) {
     const r0 = h2f[rgba[q]], g0 = h2f[rgba[q + 1]], b0 = h2f[rgba[q + 2]];
     const m = Math.max(r0, g0, b0) * gain;
     let keep = m <= 0.8 ? 0 : m >= 1 ? 1 : (m - 0.8) / 0.2;
     keep = keep * keep * (3 - 2 * keep);
     const mix = k * (1 - keep);
-    rgba[q] = toHalf(r0 + (decSRGB(clamp01(out[p])) / gain - r0) * mix);
-    rgba[q + 1] = toHalf(g0 + (decSRGB(clamp01(out[p + 1])) / gain - g0) * mix);
-    rgba[q + 2] = toHalf(b0 + (decSRGB(clamp01(out[p + 2])) / gain - b0) * mix);
+    rgba[q] = toHalf(r0 + (back(out[p]) - r0) * mix);
+    rgba[q + 1] = toHalf(g0 + (back(out[p + 1]) - g0) * mix);
+    rgba[q + 2] = toHalf(b0 + (back(out[p + 2]) - b0) * mix);
   }
   out = null;
   await checkpoint();
+  // compressing and writing happen elsewhere, so this worker can start on the next frame
   const head = Object.assign({}, d.meta || {}, {
     width: W, height: H, name: d.name,
     colorspace: 'srgb-linear', format: 'rgba16f', version: 2,
     compression: 'deflate-shuffle',
     denoised: { model: d.model, strength: k, gain: Math.round(gain * 100) / 100, device: W_.label, seconds: Math.round(secs), from: d.from, at: new Date().toISOString() }
   });
-  const file = await encodeFedr(head, rgba);
-  return { file, rgba, secs, gain };
-}
-
-/* .fedr v2: "FEDR" | u32 headerLen | JSON header | deflate(low bytes ‖ high bytes).
-   Splitting each half float's two bytes into planes lets deflate find the
-   structure in the high bytes; it roughly halves the file. */
-async function encodeFedr(head, rgba) {
-  const u8 = new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength);
-  const n = rgba.length, shuf = new Uint8Array(n * 2);
-  for (let i = 0; i < n; i++) { shuf[i] = u8[2 * i]; shuf[n + i] = u8[2 * i + 1]; }
-  const packed = new Uint8Array(await new Response(new Blob([shuf]).stream().pipeThrough(new CompressionStream('deflate'))).arrayBuffer());
-  let hb = new TextEncoder().encode(JSON.stringify(head));
-  const pad = (4 - hb.length % 4) % 4;
-  if (pad) { const t = new Uint8Array(hb.length + pad); t.set(hb); t.fill(32, hb.length); hb = t; }
-  const out = new Uint8Array(8 + hb.length + packed.length);
-  out.set([70, 69, 68, 82], 0);
-  new DataView(out.buffer).setUint32(4, hb.length, true);
-  out.set(hb, 8);
-  out.set(packed, 8 + hb.length);
-  return out;
+  return { head, rgba, secs, gain };
 }
 
 /* ---------- messages ---------- */
@@ -282,8 +275,7 @@ self.onmessage = async e => {
     W_.cancelled = false;
     try {
       const r = await denoiseFrame(d);
-      // the pixels come back too, so a photo that is open can show them without reading the file again
-      self.postMessage({ type: 'done', id: d.id, file: r.file, rgba: r.rgba, secs: r.secs, gain: r.gain }, [r.file.buffer, r.rgba.buffer]);
+      self.postMessage({ type: 'done', id: d.id, head: r.head, rgba: r.rgba, secs: r.secs, gain: r.gain }, [r.rgba.buffer]);
     } catch (err) {
       self.postMessage({ type: 'failed', id: d.id, error: String(err && err.message || err) });
     }
