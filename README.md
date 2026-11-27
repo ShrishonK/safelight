@@ -133,6 +133,24 @@ frame goes through the network it is lifted to the exposure you edit it at (or t
 mid-grey if it is unedited), so the model sees the noise as you will; highlights that lift would clip
 keep their original pixels. On a machine with two GPUs WebGPU picks the high-performance one.
 
+**Neural denoise on one photo** — **Neural denoise…** in Detail denoises the photo on screen the same
+way Denoise all does, in the background: the denoised file (`.fedr`) takes the photo's place in its
+folder with your edits still live on top, and the original (raw or JPEG) moves into **Originals**,
+never deleted. Moving to another photo and back, closing the folder or restarting all show it
+denoised. If a folder batch is already running, the photo goes to the front of its queue.
+
+**Presets** — the Presets panel sits under the histogram. **+ Save current…** saves the look (name,
+group, an optional `1`–`9` key, and a `.slpreset` file to share if you want one); ✎ renames,
+regroups or updates a preset from the photo on screen. Hover any preset to preview it on the photo,
+click to apply. **Import…** and **From link…** bring in presets made for Lightroom, which is how they
+are shared online: Lightroom Classic / Camera Raw `.xmp`, older `.lrtemplate`, Lightroom mobile
+`.dng` presets, and `.zip` packs of any of those (folders inside a pack become groups; a look that
+ships as both `.xmp` and `.dng` installs once). Dropbox, Google Drive and GitHub share links work.
+Lightroom presets only change what they list, so they land on top of your current look; their
+values are translated to Safelight's sliders, so the result is close to the original, not
+identical. Creative profiles (LUT-based `.xmp`) can't be used. Dragging preset files onto the window
+installs them too.
+
 **Getting through a shoot** — filmstrip on the left, arrow keys to move, `⌥⌘C` / `⌥⌘V` to copy
 settings between frames, `⇧1`–`⇧9` to save a look and `1`–`9` to apply it. Presets survive
 restarts. Export one photo with a save dialog, or the whole roll into a folder.
@@ -186,6 +204,7 @@ renderer/folder.js   folder browser, filmstrip, thumbnails
 renderer/cull.js     Cull mode: flags, file-type filter, moving the keepers to a new workspace
 renderer/rawcache.js      decoding a folder's raws in the background, and the on-disk cache of decodes
 renderer/batchdenoise.js  Denoise all: the background queue, the status pill, swapping raws for .fedr
+renderer/presetimport.js  reads Lightroom .xmp / .lrtemplate / mobile .dng presets and .zip packs
 renderer/denoisecore.js   the tiled network pass, shared by the page (GPU) and the denoise worker
 renderer/gpuhost.js       the batch's GPU runtime in a frame of its own, rebuilt if the GPU is lost
 renderer/denoiseworker.js the neural denoiser in a worker, so a long batch never blocks the interface

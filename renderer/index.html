@@ -1321,6 +1321,75 @@
       color: var(--clip)
     }
 
+    /* presets */
+    .plist {
+      max-height: 320px;
+      overflow-y: auto;
+      padding-right: 2px
+    }
+
+    .pgroup {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 2px 2px;
+      font: 400 9px var(--mono);
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      color: var(--faint);
+      cursor: pointer;
+      user-select: none
+    }
+
+    .pgroup:hover {
+      color: var(--dim)
+    }
+
+    .pgroup .gn {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap
+    }
+
+    .pgroup .x {
+      font-size: 13px;
+      padding: 0 2px
+    }
+
+    .pgroup .x:hover {
+      color: var(--clip)
+    }
+
+    .pitem .slot {
+      font: 400 10px var(--mono);
+      color: var(--amber);
+      border: 1px solid var(--amber-dim);
+      border-radius: 3px;
+      padding: 0 4px
+    }
+
+    .pitem .ed {
+      color: var(--faint);
+      font-size: 11px;
+      padding: 0 2px;
+      visibility: hidden
+    }
+
+    .pitem:hover .ed {
+      visibility: visible
+    }
+
+    .pitem .ed:hover {
+      color: var(--amber)
+    }
+
+    .pfilter {
+      width: 100%;
+      box-sizing: border-box;
+      margin: 2px 0 4px
+    }
+
     .empty {
       font-size: 11px;
       color: var(--faint);
@@ -1572,6 +1641,7 @@
     </div>
   </div>
   <script src="app.js"></script>
+  <script src="presetimport.js"></script>
   <script src="native.js"></script>
   <script src="loader.js"></script>
   <script src="rawcache.js"></script>

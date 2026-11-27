@@ -232,7 +232,41 @@ function bdDenoiseFrame(frame) {
    A raw the background pass (rawcache.js) has already decoded comes straight
    from the cache; one it's decoding right now is waited for; anything else is
    decoded in a worker of the batch's own, which nothing can interrupt. */
+/* A JPEG, PNG or WebP denoised on its own goes through the same path as a raw:
+   its pixels are taken to linear half floats, exactly as the editor shows them. */
+let _bdS2L = null;
+async function bdDecodeStill(path) {
+  const t0 = performance.now();
+  const [f] = await N.readFiles([path]);
+  if (!f) throw new Error('could not read the file');
+  const bytes = new Uint8Array(f.bytes);
+  let exif = null;
+  try { exif = typeof parseExif === 'function' ? parseExif(bytes.subarray(0, 384 * 1024)) : null; } catch { exif = null; }
+  const bmp = await createImageBitmap(new Blob([bytes]), { colorSpaceConversion: 'default' });
+  const w = bmp.width, h = bmp.height;
+  const c = new OffscreenCanvas(w, h);
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.drawImage(bmp, 0, 0);
+  if (bmp.close) bmp.close();
+  const px = g.getImageData(0, 0, w, h).data;
+  if (!_bdS2L) {
+    _bdS2L = new Uint16Array(256);
+    for (let i = 0; i < 256; i++) { const v = i / 255; _bdS2L[i] = toHalf(v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)); }
+  }
+  const rgba = new Uint16Array(w * h * 4), ONE = toHalf(1);
+  for (let q = 0; q < rgba.length; q += 4) {
+    rgba[q] = _bdS2L[px[q]]; rgba[q + 1] = _bdS2L[px[q + 1]]; rgba[q + 2] = _bdS2L[px[q + 2]]; rgba[q + 3] = ONE;
+  }
+  return { w, h, rgba, meta: {}, exif, decodeSecs: (performance.now() - t0) / 1000 };
+}
+
 function bdDecode(item) {
+  if (!RAWRE.test(item.name)) {
+    const p = bdDecodeStill(item.raw);
+    p.cancel = () => { };
+    p.catch(() => { });
+    return p;
+  }
   let inner = null, cancelled = false;
   const p = (async () => {
     if (typeof PRE !== 'undefined' && PRE.inflight.has(item.raw)) { try { await PRE.inflight.get(item.raw); } catch { } }
@@ -283,7 +317,8 @@ async function bdSave(item, out, w, h) {
     BD.doneCount++;
     BD.doneAt.push(Date.now());
     bdSet(item, 'done');
-    bdSwapped(item.raw, res.fedr, res.original, { w, h, rgba: packed.rgba.buffer });
+    bdSwapped(item.raw, res.fedr, res.original, { w, h, rgba: packed.rgba.buffer }, out.head);
+    if (item.single) toast(`${bdStem(item.name)} denoised · the original is kept in the Originals folder`);
     BD.saveSecs.push((performance.now() - t0) / 1000);
   } catch (e) {
     console.error('batch denoise: saving failed', item.raw, e);
@@ -392,11 +427,13 @@ async function bdRun() {
 }
 
 /* ---------- the swap ---------- */
-function bdSwapped(raw, fedr, original, pixels) {
+function bdSwapped(raw, fedr, original, pixels, head) {
   const name = bdBase(fedr);
   // the strip keeps the camera's preview until the denoised file has a thumbnail of its own
   const thumbURL = THUMBS.get(raw);
-  rekeyPhoto(raw, fedr, name, pixels);
+  const moved = rekeyPhoto(raw, fedr, name, pixels);
+  // the entry now is the denoised file: say so, so Neural denoise won't offer to run again
+  if (moved && head && head.denoised) moved.meta = Object.assign({}, moved.meta || {}, { denoised: head.denoised });
   if (thumbURL) fetch(thumbURL).then(r => r.arrayBuffer()).then(b => N.thumbPut(fedr, new Uint8Array(b))).catch(() => { });
 
   const dir = raw.slice(0, Math.max(raw.lastIndexOf('/'), raw.lastIndexOf('\\')));
@@ -531,6 +568,33 @@ function bdStartDialog() {
       bdQueue(bdCandidates());
     };
   });
+}
+
+/* One photo, from the Neural denoise dialog. It is denoised exactly as a batch
+   frame is: the result replaces the file in its folder (a .fedr with the same
+   name), the original moves to Originals, and the photo's edits stay with it —
+   so leaving the photo and coming back, or restarting, still shows it denoised.
+   If a folder batch is already running it goes to the front of that queue. */
+function bdDenoiseOne(path, name, opts) {
+  if (!window.native || !path) return false;
+  const live = BD.items.find(it => it.raw === path && (it.status === 'queued' || it.status === 'working'));
+  if (live) { toast(live.status === 'working' ? 'This photo is being denoised now' : 'This photo is already waiting to be denoised'); return true; }
+  const it = { raw: path, name: name || bdBase(path), status: 'queued', single: true };
+  if (BD.running) {
+    const at = BD.items.findIndex(x => x.status === 'queued');
+    if (at < 0) BD.items.push(it); else BD.items.splice(at, 0, it);
+    bdSet(it, 'queued');
+    bdPill();
+    toast('Denoising this photo next, with the running batch\'s settings');
+    return true;
+  }
+  BD.opts = Object.assign({}, BD.opts, opts || {});
+  BD.failed = [];
+  clearTimeout(BD.hideTimer);
+  BD.items.push(it);
+  bdSet(it, 'queued');
+  bdRun();
+  return true;
 }
 
 function bdQueue(files) {

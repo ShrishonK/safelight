@@ -62,7 +62,7 @@ const A = {
   imgs: [], cur: -1, dummy: defaults(),
   selMask: -1, curveCh: 'rgb', before: false, cropMode: false, redeyeMode: false,
   view: { zoom: 0, ox: 0, oy: 0, fit: true },
-  clipboard: null, presets: {}, hist: null, painting: false,
+  clipboard: null, presets: {}, preview: null, hist: null, painting: false,
   drag: null
 };
 const S = () => (A.cur >= 0 ? A.imgs[A.cur].s : A.dummy);
@@ -1578,6 +1578,9 @@ function renderNow(commit) {
     const d = defaults();
     d.crop = saved.crop; d.rot90 = saved.rot90; d.flipH = saved.flipH; d.flipV = saved.flipV; d.straighten = saved.straighten;
     im.s = d;
+  } else if (A.preview && A.preview.im === im) {
+    // hovering a preset shows it on the photo without touching the photo's own settings
+    im.s = A.preview.s;
   }
   if (A.cropMode) im.s = Object.assign({}, im.s, { crop: { x: 0, y: 0, w: 1, h: 1 } });
   uploadLUT();
@@ -1596,7 +1599,8 @@ function renderNow(commit) {
   drawOverlay();
   const st = $('#stat');
   st.textContent = `${im.name} · ${Math.round(V.G.outW)}×${Math.round(V.G.outH)} · ${Math.round(A.view.zoom * 100)}%` +
-    (im.linear ? ' · linear raw' : '') + (A.before ? ' · BEFORE' : '');
+    (im.linear ? ' · linear raw' : '') + (A.before ? ' · BEFORE' : '') +
+    (!A.before && A.preview && A.preview.im === im ? ' · preview: ' + A.preview.name : '');
   $('#badge').hidden = !A.before; $('#badge').textContent = 'BEFORE';
 
   if (commit) {
@@ -2107,7 +2111,7 @@ function thumbFromHalf(data, w, h) {
 
 function selectImage(i) {
   if (i < 0 || i >= A.imgs.length) return;
-  A.cur = i; A.selMask = -1; A.showMask = false; A.cropMode = false; A.cropDraft = null; A.redeyeMode = false;
+  A.cur = i; A.selMask = -1; A.showMask = false; A.cropMode = false; A.cropDraft = null; A.redeyeMode = false; A.preview = null;
   const rb = $('#redeyeBtn'); if (rb) rb.classList.remove('on');
   const cb = $('#cropBtn'); if (cb) cb.classList.remove('on');
   A.view = { zoom: 0, ox: .5, oy: .5, fit: true };
@@ -2321,7 +2325,9 @@ function wireKeys() {
         A.presets[slot] = s; toast('Preset ' + slot + ' saved');
       } else if (A.presets[slot] && A.cur >= 0) {
         const im = IM(), keep = { crop: im.s.crop, rot90: im.s.rot90, flipH: im.s.flipH, flipV: im.s.flipV, straighten: im.s.straighten, redeye: im.s.redeye || [] };
-        im.s = Object.assign(defaults(), JSON.parse(JSON.stringify(A.presets[slot])), keep);
+        A.preview = null;
+        if (typeof presetResult === 'function') im.s = presetResult(im, { settings: A.presets[slot], partial: !!A.presets[slot]._partial });
+        else im.s = Object.assign(defaults(), JSON.parse(JSON.stringify(A.presets[slot])), keep);
         A.selMask = im.s.masks.length ? 0 : -1;
         syncAll(); rebuildMasks(); requestRender(true); toast('Preset ' + slot);
       }

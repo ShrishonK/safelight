@@ -3,9 +3,11 @@
    ------------------------------------------------------------
    Unlike the slider denoiser, this does not average neighbours:
    it runs a trained network that reconstructs what was probably
-   there. It is slow and one-shot, so it produces a NEW photo in
-   the filmstrip rather than running on every slider move — the
-   original is never touched.
+   there. It is slow and one-shot, so it never runs on a slider
+   move. A photo with a file behind it is denoised in place by the
+   background denoiser (batchdenoise.js): the result replaces the
+   file and the original moves to Originals, never deleted. Only a
+   photo with no file gets a new frame in the filmstrip.
    ============================================================ */
 'use strict';
 
@@ -420,11 +422,35 @@ async function installModelFiles(files) {
 }
 
 /* ---------- model management ---------- */
+/* A photo that lives in a file is denoised in place, the way Denoise all does it:
+   the result replaces the file (as a .fedr), the original moves to Originals,
+   and the edits stay live on top. That is what keeps it denoised when you move
+   to another photo and come back. Only a photo with no file behind it still gets
+   the old treatment — a new frame with the look baked in. */
+function aiInPlace(im) {
+  return !!(im && im.path && window.native && typeof bdDenoiseOne === 'function' && (im.kind === 'raw' || im.kind === 'std'));
+}
+function aiAlreadyDenoised(im) {
+  return !!(im && im.kind === 'fedr' && im.meta && im.meta.denoised);
+}
+
 async function aiModelDialog() {
   const installed = (await modelList()).filter(k => k !== '__subject__');
+  const im = IM();
+  const inPlace = aiInPlace(im), done = aiAlreadyDenoised(im);
+  const dn = done ? im.meta.denoised : null;
+  const status = done
+    ? `<div class="hint" style="color:var(--text)">This photo is already denoised${dn.model ? ' (' + String(dn.model).replace(/\.onnx$/i, '') + (dn.strength ? ', ' + Math.round(dn.strength * 100) + '%' : '') + ')' : ''}.
+       The untouched original is in the <b>Originals</b> folder beside it — open that folder if you ever need it back.</div>`
+    : inPlace
+      ? `<div class="hint" style="color:var(--text)">Runs in the background — keep editing. The denoised photo replaces this one in its
+         folder with your edits still on it, so it stays denoised when you move on and come back. The original
+         ${im.kind === 'raw' ? 'raw' : 'file'} moves into an <b>Originals</b> folder beside it, never deleted.</div>`
+      : '';
   document.getElementById('card').innerHTML = `
-    <h4>Neural denoise model</h4>
+    <h4>Neural denoise</h4>
     <div class="cbody">
+      ${status}
       <div class="hint">SCUNet colour denoise is built in and used by default. Other .onnx models
       (60–130 MB, licensed separately) can be added below — select the <b>.onnx</b> file, and if
       the download also came with an <b>.onnx.data</b> file, select both together. Cached
@@ -444,7 +470,7 @@ async function aiModelDialog() {
     </div>
     <div class="foot">
       <button class="tb" id="aiCancel">Close</button>
-      <button class="tb primary" id="aiRun">Denoise</button>
+      ${done ? '' : '<button class="tb primary" id="aiRun">Denoise this photo</button>'}
     </div>`;
   document.getElementById('aiDev').value = AI.device;
   document.getElementById('modal').classList.add('open');
@@ -461,12 +487,21 @@ async function aiModelDialog() {
     } catch (e) { showError('That model would not load', [String(e.message)]); }
     finally { busy(null); }
   };
-  document.getElementById('aiRun').onclick = async () => {
+  const run = document.getElementById('aiRun');
+  if (!run) return;
+  run.onclick = async () => {
     const key = document.getElementById('aiPick').value;
-    const strength = (parseInt(document.getElementById('aiStr').value) || 100) / 100;
+    const strength = Math.max(.1, Math.min(1, (parseInt(document.getElementById('aiStr').value) || 100) / 100));
     AI.device = document.getElementById('aiDev').value;
     N.storeSet({ aiDevice: AI.device });
     document.getElementById('modal').classList.remove('open');
+    const cur = IM();
+    if (aiInPlace(cur)) {
+      // make sure the look you have right now is on disk before the file is swapped
+      if (typeof persistNow === 'function') persistNow(cur);
+      bdDenoiseOne(cur.path, cur.name, { model: key, strength, device: AI.device });
+      return;
+    }
     try {
       if (!AI.session || AI.modelName !== key || AI.loadedDevice !== AI.device) {
         await busy('Loading ' + key);

@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell, nativeTheme, powerSaveBlocker } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, shell, nativeTheme, powerSaveBlocker, net } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -102,6 +102,10 @@ function buildMenu() {
       { label: 'Clear decoded raw cache', click: menuSend('clear-decoded') },
       { type: 'separator' },
       { label: 'Select subject', accelerator: 'CmdOrCtrl+Shift+S', click: menuSend('select-subject') },
+      { label: 'Save as preset…', click: menuSend('new-preset') },
+      { label: 'Import presets…', click: menuSend('import-presets') },
+      { label: 'Import preset from a link…', click: menuSend('import-preset-link') },
+      { type: 'separator' },
       { label: 'Save settings sidecar…', click: menuSend('save-sidecar') },
       { label: 'Load settings sidecar…', click: menuSend('load-sidecar') },
       { type: 'separator' },
@@ -164,7 +168,7 @@ ipcMain.handle('dialog:open', async () => {
       { name: 'All photos', extensions: [...STILL, ...RAW] },
       { name: 'Camera raw', extensions: RAW },
       { name: 'Standard images', extensions: STILL },
-      { name: 'Presets and settings', extensions: ['slpreset', 'slcar', 'json'] },
+      { name: 'Presets and settings', extensions: ['slpreset', 'slcar', 'json', 'xmp', 'lrtemplate', 'zip'] },
       { name: 'Neural models', extensions: ['onnx', 'data', 'onnx_data'] },
       { name: 'All files', extensions: ['*'] }
     ]
@@ -185,6 +189,84 @@ async function describeAll(paths) {
   return out.filter(Boolean);
 }
 ipcMain.handle('file:read', async (_e, paths) => (await Promise.all(paths.map(readOne))).filter(Boolean));
+
+/* ---------- presets from other editors and from the web ----------
+   Presets found online come as Lightroom .xmp / .lrtemplate files, Lightroom
+   mobile .dng files, or a .zip of them. These arrive in the renderer with their
+   bytes, where presetimport.js reads them. */
+const PRESET_EXT = ['xmp', 'lrtemplate', 'dng', 'zip', 'slpreset', 'json'];
+ipcMain.handle('presets:pick', async () => {
+  const st = readStore();
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Import presets',
+    defaultPath: st.lastPresetDir || app.getPath('downloads'),
+    properties: ['openFile', 'multiSelections'],
+    filters: [
+      { name: 'Presets (Lightroom, Lightroom mobile, Safelight, zip packs)', extensions: PRESET_EXT },
+      { name: 'All files', extensions: ['*'] }
+    ]
+  });
+  if (r.canceled || !r.filePaths.length) return [];
+  st.lastPresetDir = path.dirname(r.filePaths[0]); writeStore(st);
+  const out = [];
+  for (const p of r.filePaths) {
+    try {
+      const s = await fs.promises.stat(p);
+      if (s.size > 200 * 1024 * 1024) { out.push({ name: path.basename(p), error: 'over 200 MB — too big to be a preset' }); continue; }
+      out.push({ name: path.basename(p), bytes: await fs.promises.readFile(p) });
+    } catch (e) { out.push({ name: path.basename(p), error: e.message }); }
+  }
+  return out;
+});
+
+/* share links that open a web page are rewritten to the file they point at */
+function directLink(u) {
+  const url = new URL(u);
+  const h = url.hostname.replace(/^www\./, '');
+  if (h === 'dropbox.com' || h.endsWith('.dropbox.com')) { url.searchParams.set('dl', '1'); return url.href; }
+  if (h === 'drive.google.com') {
+    const m = /\/file\/d\/([^/]+)/.exec(url.pathname);
+    const id = m ? m[1] : url.searchParams.get('id');
+    if (id) return 'https://drive.usercontent.google.com/download?export=download&confirm=t&id=' + encodeURIComponent(id);
+  }
+  if (h === 'github.com' && /\/blob\//.test(url.pathname)) {
+    return 'https://raw.githubusercontent.com' + url.pathname.replace('/blob/', '/');
+  }
+  return url.href;
+}
+
+ipcMain.handle('presets:fetch', async (_e, link) => {
+  let u;
+  try { u = new URL(String(link).trim()); } catch { return { error: 'that is not a web address' }; }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return { error: 'only http and https links can be downloaded' };
+  try {
+    const href = directLink(u.href);
+    const res = await net.fetch(href, { redirect: 'follow', headers: { 'User-Agent': 'Safelight/' + app.getVersion() } });
+    if (!res.ok) return { error: `the site answered ${res.status} ${res.statusText || ''}`.trim() };
+    const len = parseInt(res.headers.get('content-length') || '0', 10);
+    if (len > 200 * 1024 * 1024) return { error: 'that file is over 200 MB — too big to be a preset' };
+    const bytes = Buffer.from(await res.arrayBuffer());
+    const type = (res.headers.get('content-type') || '').toLowerCase();
+    const head = bytes.subarray(0, 512).toString('latin1').trimStart().toLowerCase();
+    if (type.includes('text/html') || head.startsWith('<!doctype html') || head.startsWith('<html')) {
+      return { error: 'that link opens a web page, not a file. Use the download button on the page, then choose Import… and pick the file you downloaded.' };
+    }
+    // a name from the server if it gave one, otherwise from the address
+    let name = '';
+    const cd = res.headers.get('content-disposition') || '';
+    const m = /filename\*=(?:UTF-8'')?([^;]+)/i.exec(cd) || /filename="?([^";]+)"?/i.exec(cd);
+    if (m) { try { name = decodeURIComponent(m[1].trim()); } catch { name = m[1].trim(); } }
+    if (!name) name = decodeURIComponent(path.basename(new URL(res.url || href).pathname)) || 'preset';
+    if (!/\.[a-z0-9]{2,10}$/i.test(name)) {
+      // no extension: sniff a zip or an XMP packet
+      if (bytes[0] === 0x50 && bytes[1] === 0x4b) name += '.zip';
+      else if (/<x:xmpmeta|camera-raw-settings/.test(bytes.subarray(0, 4096).toString('latin1'))) name += '.xmp';
+    }
+    return { name, bytes };
+  } catch (e) {
+    return { error: 'could not download it — ' + (e && e.message || e) };
+  }
+});
 
 ipcMain.handle('dialog:save', async (_e, { defaultName, filters, bytes }) => {
   const st = readStore();
